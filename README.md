@@ -24,7 +24,7 @@ logitray sits in your system tray and talks to your Logitech wireless mouse dire
 2. Put it anywhere you like and double-click it — it appears in the system tray (check the `^` overflow if you don't see it).
 3. (Optional) From a terminal, run `logitray.exe --once` to print the current battery level and confirm your device is detected.
 
-No installer, no admin rights, no Logitech software needed.
+No installer, no admin rights, no Logitech software needed. logitray does not start with Windows unless you enable **Start at login** from the tray menu.
 
 ## In the tray
 
@@ -59,7 +59,7 @@ Configuration lives in `%APPDATA%\logitray\config.toml` (created on first run):
 | `low_battery_threshold` | `15` | Percent at/below which a low-battery toast fires |
 | `low_battery_cooldown_minutes` | `120` | Minimum time between repeat alerts per device |
 | `selected_device_id` | `""` | Which device the tray follows (set via the menu) |
-| `autostart` | `true` | Start logitray when you log in |
+| `autostart` | `false` | Start logitray when you log in |
 | `log_level` | `"info"` | Log verbosity (`error`/`warn`/`info`/`debug`/`trace`) |
 | `view_mode` | `"icon"` | Tray display: `icon` (battery glyph) or `text` (percentage) |
 
