@@ -1,0 +1,19 @@
+[package]
+name = "logitray"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0"
+dirs = "6.0"
+hidapi = { version = "2.6", features = ["windows-native"] }
+serde = { version = "1.0", features = ["derive"] }
+tao = "0.34"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+tray-icon = "0.21"
+
+[target.'cfg(windows)'.dependencies]
+tauri-winrt-notification = "0.7"
+winreg = "0.55"
