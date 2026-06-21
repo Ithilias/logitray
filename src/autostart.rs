@@ -13,8 +13,8 @@ const RUN_VALUE_NAME: &str = APP_ID;
 
 #[cfg(target_os = "windows")]
 pub fn is_enabled() -> Result<bool> {
-    use winreg::RegKey;
     use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    use winreg::RegKey;
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let key = hkcu
@@ -31,8 +31,8 @@ pub fn is_enabled() -> Result<bool> {
 
 #[cfg(target_os = "windows")]
 pub fn set_enabled(exe_path: &Path, enabled: bool) -> Result<()> {
-    use winreg::RegKey;
     use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
 
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
     let (key, _) = hkcu

@@ -1,13 +1,12 @@
 use crate::device_map;
 use crate::hid::protocol::{
-    LONG_REPORT_ID, MAX_RETRIES, READ_TIMEOUT_MS, SHORT_REPORT_ID, SW_ID, ShortMsg,
     get_battery_status, get_battery_voltage, get_feature, get_feature_count, get_feature_id,
     get_unified_battery_status, is_charging_from_flags, is_charging_from_status, mv_to_percent,
-    ping,
+    ping, ShortMsg, LONG_REPORT_ID, MAX_RETRIES, READ_TIMEOUT_MS, SHORT_REPORT_ID, SW_ID,
 };
 use crate::hid::scanner::{open_receiver, scan_receivers};
 use crate::model::{BatteryState, PollResult};
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use hidapi::{HidApi, HidDevice};
 use std::collections::HashMap;
 use std::thread;
@@ -50,7 +49,9 @@ pub fn poll_devices(api: &HidApi, cache: &mut FeatureCache) -> PollResult {
     for receiver in &receivers {
         match open_receiver(api, receiver) {
             Ok(dev) => query_receiver(dev, receiver.pid, cache, &mut result),
-            Err(err) => result.errors.push(format!("receiver {:04X}: {err}", receiver.pid)),
+            Err(err) => result
+                .errors
+                .push(format!("receiver {:04X}: {err}", receiver.pid)),
         }
     }
 
@@ -108,9 +109,13 @@ fn query_device(
             None => String::new(),
         };
 
-        cache
-            .devices
-            .insert(device_key.clone(), DeviceCache { battery, display_name });
+        cache.devices.insert(
+            device_key.clone(),
+            DeviceCache {
+                battery,
+                display_name,
+            },
+        );
     }
 
     let entry = &cache.devices[&device_key];
@@ -119,8 +124,7 @@ fn query_device(
     };
     let display_name = entry.display_name.clone();
 
-    let (battery_percent, is_charging) =
-        read_battery(dev, device_index, feature_id, feature_idx)?;
+    let (battery_percent, is_charging) = read_battery(dev, device_index, feature_id, feature_idx)?;
 
     Ok(Some(BatteryState {
         device_key,
@@ -182,8 +186,10 @@ fn read_device_name(
     let mut name_bytes = Vec::with_capacity(name_len);
     while name_bytes.len() < name_len {
         let offset = name_bytes.len() as u8;
-        let buf =
-            send_recv(dev, ShortMsg::new(device_index, name_idx, 0x01, [offset, 0, 0]))?;
+        let buf = send_recv(
+            dev,
+            ShortMsg::new(device_index, name_idx, 0x01, [offset, 0, 0]),
+        )?;
         // params are buf[4..7]
         for &b in &buf[4..7] {
             if name_bytes.len() < name_len {
@@ -259,20 +265,18 @@ fn send_recv(dev: &mut HidDevice, msg: ShortMsg) -> Result<[u8; 7]> {
             // Only the first 7 bytes carry the header + the params we read.
             // hidapi on Windows may or may not prepend the report-id byte; a
             // genuine HID++ report starts with 0x10 (short) or 0x11 (long).
-            let response: [u8; 7] = if n >= 8 && buf[0] != SHORT_REPORT_ID && buf[0] != LONG_REPORT_ID {
-                // report-id was prepended, skip it
-                buf[1..8].try_into().unwrap()
-            } else if n >= 7 {
-                buf[0..7].try_into().unwrap()
-            } else {
-                continue;
-            };
+            let response: [u8; 7] =
+                if n >= 8 && buf[0] != SHORT_REPORT_ID && buf[0] != LONG_REPORT_ID {
+                    // report-id was prepended, skip it
+                    buf[1..8].try_into().unwrap()
+                } else if n >= 7 {
+                    buf[0..7].try_into().unwrap()
+                } else {
+                    continue;
+                };
 
             if ShortMsg::is_error(&response) {
-                bail!(
-                    "HID++ error response for feature 0x{:02X}",
-                    request[2]
-                );
+                bail!("HID++ error response for feature 0x{:02X}", request[2]);
             }
 
             // Match on feature_index and SW_ID.

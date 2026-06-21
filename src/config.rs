@@ -72,8 +72,7 @@ fn write_atomic(path: &Path, raw: &[u8]) -> Result<()> {
     let parent = path
         .parent()
         .with_context(|| format!("missing parent directory for {}", path.display()))?;
-    fs::create_dir_all(parent)
-        .with_context(|| format!("failed creating {}", parent.display()))?;
+    fs::create_dir_all(parent).with_context(|| format!("failed creating {}", parent.display()))?;
     let file_name = path
         .file_name()
         .with_context(|| format!("missing file name for {}", path.display()))?
@@ -91,8 +90,7 @@ fn write_atomic(path: &Path, raw: &[u8]) -> Result<()> {
 
     #[cfg(target_os = "windows")]
     if path.exists() {
-        fs::remove_file(path)
-            .with_context(|| format!("failed replacing {}", path.display()))?;
+        fs::remove_file(path).with_context(|| format!("failed replacing {}", path.display()))?;
     }
 
     if let Err(err) = fs::rename(&tmp_path, path) {
@@ -117,8 +115,8 @@ pub fn load_or_create_config() -> Result<AppConfig> {
         return Ok(cfg);
     }
 
-    let raw = fs::read_to_string(&path)
-        .with_context(|| format!("failed reading {}", path.display()))?;
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("failed reading {}", path.display()))?;
     let parsed: AppConfig =
         toml::from_str(&raw).with_context(|| format!("failed parsing {}", path.display()))?;
     Ok(parsed)

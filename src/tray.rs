@@ -1,10 +1,10 @@
-use crate::APP_ID;
 use crate::autostart;
 use crate::config::{self, AppConfig};
 use crate::hid::client;
 use crate::icon;
 use crate::model::{BatteryState, PollResult};
 use crate::notify::Notifier;
+use crate::APP_ID;
 use anyhow::{Context, Result};
 use hidapi::HidApi;
 use std::sync::mpsc;
@@ -77,11 +77,7 @@ impl MenuHandles {
         })
     }
 
-    fn rebuild_device_menu(
-        &mut self,
-        devices: &[BatteryState],
-        selected_id: &str,
-    ) -> Result<()> {
+    fn rebuild_device_menu(&mut self, devices: &[BatteryState], selected_id: &str) -> Result<()> {
         for item in self.select_submenu.items() {
             remove_item(&self.select_submenu, &item)?;
         }
@@ -99,10 +95,19 @@ impl MenuHandles {
                 "{} — {}{}",
                 device.display_name,
                 device.battery_percent,
-                if device.is_charging { "% (charging)" } else { "%" }
+                if device.is_charging {
+                    "% (charging)"
+                } else {
+                    "%"
+                }
             );
-            let item =
-                CheckMenuItem::with_id(format!("device:{}", device.device_key), label, true, checked, None);
+            let item = CheckMenuItem::with_id(
+                format!("device:{}", device.device_key),
+                label,
+                true,
+                checked,
+                None,
+            );
             self.select_submenu.append(&item)?;
             self.device_items.push(item);
         }
@@ -112,8 +117,7 @@ impl MenuHandles {
 
     fn set_selected(&self, selected_id: &str) {
         for item in &self.device_items {
-            let is_selected =
-                item.id().0.strip_prefix("device:") == Some(selected_id);
+            let is_selected = item.id().0.strip_prefix("device:") == Some(selected_id);
             item.set_checked(is_selected);
         }
     }
@@ -153,8 +157,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     let initial_icon = icon::neutral_icon()?;
     let mut tray = build_tray_icon(&menu.root, initial_icon)?;
 
-    let mut notifier =
-        Notifier::new(cfg.low_battery_threshold, cfg.low_battery_cooldown_minutes);
+    let mut notifier = Notifier::new(cfg.low_battery_threshold, cfg.low_battery_cooldown_minutes);
     let mut devices: Vec<BatteryState> = Vec::new();
     let mut selected_id = cfg.selected_device_id.clone();
     // Number of consecutive polls that returned nothing. We keep showing the
@@ -302,7 +305,11 @@ fn refresh_tray_visuals(
             "{}: {}{}",
             device.display_name,
             device.battery_percent,
-            if device.is_charging { "% (charging)" } else { "%" }
+            if device.is_charging {
+                "% (charging)"
+            } else {
+                "%"
+            }
         );
         tray.set_tooltip(Some(tooltip.clone()))?;
         status_item.set_text(&tooltip);

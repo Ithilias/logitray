@@ -5,8 +5,8 @@ use hidapi::HidApi;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::fmt::writer::MakeWriter;
+use tracing_subscriber::EnvFilter;
 
 const LOG_FILES_TO_KEEP: usize = 3;
 const MAX_LOG_FILE_BYTES: u64 = 1_048_576;
@@ -77,7 +77,9 @@ fn init_logging(cfg: &config::AppConfig) {
             .with_target(false)
             .with_thread_ids(true)
             .with_ansi(false)
-            .with_writer(LogFileWriter { path: log_path.clone() })
+            .with_writer(LogFileWriter {
+                path: log_path.clone(),
+            })
             .try_init();
         tracing::info!("logging to {}", log_path.display());
     } else {
@@ -103,7 +105,11 @@ impl<'a> MakeWriter<'a> for LogFileWriter {
 
     fn make_writer(&'a self) -> Self::Writer {
         let _ = maybe_rotate_logs(&self.path, MAX_LOG_FILE_BYTES, LOG_FILES_TO_KEEP);
-        match OpenOptions::new().create(true).append(true).open(&self.path) {
+        match OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+        {
             Ok(file) => Box::new(file),
             Err(_) => Box::new(io::sink()),
         }
@@ -145,6 +151,9 @@ fn maybe_rotate_logs(base: &Path, max_bytes: u64, keep: usize) -> Result<()> {
 
 fn rotated_path(base: &Path, index: usize) -> Result<PathBuf> {
     let parent = base.parent().context("missing parent")?;
-    let name = base.file_name().context("missing file name")?.to_string_lossy();
+    let name = base
+        .file_name()
+        .context("missing file name")?
+        .to_string_lossy();
     Ok(parent.join(format!("{name}.{index}")))
 }
