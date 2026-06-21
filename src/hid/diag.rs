@@ -54,7 +54,11 @@ pub fn run_diag() {
     // Collect the long-report interface (usage 0x0002) separately for the long ping probe.
     let long_paths: Vec<_> = api
         .device_list()
-        .filter(|i| i.vendor_id() == LOGITECH_VID && i.usage_page() == HIDPP_USAGE_PAGE && i.usage() == 0x0002)
+        .filter(|i| {
+            i.vendor_id() == LOGITECH_VID
+                && i.usage_page() == HIDPP_USAGE_PAGE
+                && i.usage() == 0x0002
+        })
         .map(|i| (i.product_id(), i.path().to_owned()))
         .collect();
 
@@ -97,7 +101,9 @@ pub fn run_diag() {
         }
     }
 
-    println!("\n=== LONG ping (report 0x11, 20 bytes) on usage=0x0002 interface, indices 1..=6 ===");
+    println!(
+        "\n=== LONG ping (report 0x11, 20 bytes) on usage=0x0002 interface, indices 1..=6 ==="
+    );
     if long_paths.is_empty() {
         println!("(no usage=0x0002 long-report interface found)");
         return;

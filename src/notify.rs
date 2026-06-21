@@ -84,8 +84,8 @@ fn toast_app_id() -> &'static str {
 fn register_toast_aumid() -> anyhow::Result<()> {
     use crate::APP_ID;
     use anyhow::Context;
-    use winreg::RegKey;
     use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
 
     let key_path = format!("SOFTWARE\\Classes\\AppUserModelId\\{APP_ID}");
     let hkcu = RegKey::predef(HKEY_CURRENT_USER);
@@ -111,7 +111,7 @@ fn low_battery_title(state: &BatteryState) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Notifier, low_battery_title};
+    use super::{low_battery_title, Notifier};
     use crate::model::BatteryState;
     use std::time::{Duration, Instant};
 
@@ -146,13 +146,14 @@ mod tests {
         assert!(notifier.should_notify(&state, now));
         notifier.last_sent.insert(state.device_key.clone(), now);
         assert!(!notifier.should_notify(&state, now + Duration::from_secs(30)));
-        assert!(
-            notifier.should_notify(&state, now + notifier.cooldown + Duration::from_secs(1))
-        );
+        assert!(notifier.should_notify(&state, now + notifier.cooldown + Duration::from_secs(1)));
     }
 
     #[test]
     fn title_format() {
-        assert_eq!(low_battery_title(&make_state(12, false)), "MX Master 3: 12%");
+        assert_eq!(
+            low_battery_title(&make_state(12, false)),
+            "MX Master 3: 12%"
+        );
     }
 }
