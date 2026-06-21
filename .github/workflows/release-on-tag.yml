@@ -23,15 +23,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Verify tag matches Cargo.toml version
-        shell: pwsh
+        shell: bash
         run: |
-          $tag = "${{ github.ref_name }}" -replace '^v', ''
-          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
-          if ($tag -ne $ver) {
-            Write-Error "Tag '$tag' does not match Cargo.toml version '$ver'"
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          cargo_version="v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$tag" != "$cargo_version" ]; then
+            echo "::error::Tag '$tag' does not match Cargo.toml version '$cargo_version'"
             exit 1
-          }
-          Write-Host "Tag matches Cargo.toml version: $ver"
+          fi
 
       - name: Test
         run: cargo test --all-targets
@@ -39,22 +39,42 @@ jobs:
       - name: Build release
         run: cargo build --release --target x86_64-pc-windows-msvc
 
-      - name: Package exe + checksum
+      - name: Prepare release assets
         shell: pwsh
         run: |
-          Copy-Item target/x86_64-pc-windows-msvc/release/logitray.exe logitray.exe
+          $exe = "target/x86_64-pc-windows-msvc/release/logitray.exe"
+          if (-not (Test-Path $exe)) {
+            throw "Expected binary not found at $exe"
+          }
+          Copy-Item $exe logitray.exe
           $hash = (Get-FileHash logitray.exe -Algorithm SHA256).Hash.ToLower()
-          "$hash  logitray.exe" | Out-File -Encoding ascii -NoNewline logitray.exe.sha256
+          "$hash  logitray.exe" | Set-Content SHA256SUMS.txt
+
+      - name: Determine release notes range
+        id: release_notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          if prev_tag=$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null); then
+            echo "prev_tag=$prev_tag" >> "$GITHUB_OUTPUT"
+          else
+            echo "prev_tag=" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Create or update GitHub release
-        shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
+        shell: bash
         run: |
-          $tag = "${{ github.ref_name }}"
-          gh release view $tag 2>$null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $tag logitray.exe logitray.exe.sha256 --clobber
-          } else {
-            gh release create $tag logitray.exe logitray.exe.sha256 --title $tag --generate-notes
-          }
+          set -euo pipefail
+          tag="${{ github.ref_name }}"
+          prev_tag="${{ steps.release_notes.outputs.prev_tag }}"
+          release_args=(--title "$tag" --generate-notes)
+          if [ -n "$prev_tag" ]; then
+            release_args+=(--notes-start-tag "$prev_tag")
+          fi
+          if ! gh release view "$tag" > /dev/null 2>&1; then
+            gh release create "$tag" "${release_args[@]}"
+          fi
+          gh release upload "$tag" logitray.exe SHA256SUMS.txt --clobber
