@@ -23,8 +23,28 @@ enum UserEvent {
 
 enum WorkerCommand {
     Refresh,
+    SetInterval(u64),
     Exit,
 }
+
+/// Preset choices for the menu submenus. The numeric value is encoded into each
+/// item's id (e.g. "poll:60") so the event handler can parse it back.
+const POLL_PRESETS: &[(&str, u64)] = &[
+    ("15 seconds", 15),
+    ("30 seconds", 30),
+    ("1 minute", 60),
+    ("2 minutes", 120),
+    ("5 minutes", 300),
+    ("15 minutes", 900),
+];
+const THRESHOLD_PRESETS: &[u8] = &[5, 10, 15, 20, 25, 30];
+const COOLDOWN_PRESETS: &[(&str, u64)] = &[
+    ("30 minutes", 30),
+    ("1 hour", 60),
+    ("2 hours", 120),
+    ("4 hours", 240),
+    ("8 hours", 480),
+];
 
 struct MenuHandles {
     root: Menu,
@@ -32,13 +52,18 @@ struct MenuHandles {
     select_submenu: Submenu,
     refresh_item: MenuItem,
     view_mode_item: CheckMenuItem,
+    notify_item: CheckMenuItem,
     autostart_item: CheckMenuItem,
+    open_config_item: MenuItem,
     exit_item: MenuItem,
     device_items: Vec<CheckMenuItem>,
+    poll_items: Vec<CheckMenuItem>,
+    threshold_items: Vec<CheckMenuItem>,
+    cooldown_items: Vec<CheckMenuItem>,
 }
 
 impl MenuHandles {
-    fn build(initial_autostart: bool, initial_text_mode: bool) -> Result<Self> {
+    fn build(cfg: &AppConfig, initial_autostart: bool, initial_text_mode: bool) -> Result<Self> {
         let root = Menu::new();
         let status_item = MenuItem::new("No Logitech devices found", false, None);
         let select_submenu = Submenu::new("Select Device", true);
@@ -50,18 +75,58 @@ impl MenuHandles {
             initial_text_mode,
             None,
         );
+
+        let (poll_submenu, poll_items) = build_preset_submenu(
+            "Poll interval",
+            "poll",
+            POLL_PRESETS
+                .iter()
+                .map(|&(label, value)| (label.to_string(), value)),
+            cfg.poll_interval_seconds,
+        )?;
+        let notify_item = CheckMenuItem::with_id(
+            "notify",
+            "Enable low-battery notifications",
+            true,
+            cfg.notifications_enabled,
+            None,
+        );
+        let (threshold_submenu, threshold_items) = build_preset_submenu(
+            "Low battery alert at",
+            "threshold",
+            THRESHOLD_PRESETS
+                .iter()
+                .map(|&n| (format!("{n}%"), u64::from(n))),
+            u64::from(cfg.low_battery_threshold),
+        )?;
+        let (cooldown_submenu, cooldown_items) = build_preset_submenu(
+            "Reminder interval",
+            "cooldown",
+            COOLDOWN_PRESETS
+                .iter()
+                .map(|&(label, value)| (label.to_string(), value)),
+            cfg.low_battery_cooldown_minutes,
+        )?;
+
         let autostart_item =
             CheckMenuItem::with_id("autostart", "Start at login", true, initial_autostart, None);
+        let open_config_item = MenuItem::with_id("openconfig", "Open config file…", true, None);
         let exit_item = MenuItem::with_id("exit", "Exit", true, None);
-        let separator = PredefinedMenuItem::separator();
 
         root.append_items(&[
             &status_item,
             &select_submenu,
             &refresh_item,
+            &PredefinedMenuItem::separator(),
             &view_mode_item,
+            &poll_submenu,
+            &notify_item,
+            &threshold_submenu,
+            &cooldown_submenu,
             &autostart_item,
-            &separator,
+            &PredefinedMenuItem::separator(),
+            &open_config_item,
+            &PredefinedMenuItem::separator(),
             &exit_item,
         ])?;
 
@@ -71,9 +136,14 @@ impl MenuHandles {
             select_submenu,
             refresh_item,
             view_mode_item,
+            notify_item,
             autostart_item,
+            open_config_item,
             exit_item,
             device_items: Vec::new(),
+            poll_items,
+            threshold_items,
+            cooldown_items,
         })
     }
 
@@ -125,6 +195,41 @@ impl MenuHandles {
     fn touch_ids(&self) {
         let _ = self.refresh_item.id();
         let _ = self.exit_item.id();
+        let _ = self.open_config_item.id();
+    }
+}
+
+/// Build a submenu of radio-style preset choices. Each item's id is
+/// `"{prefix}:{value}"`; the item whose value equals `current` starts checked.
+fn build_preset_submenu(
+    title: &str,
+    prefix: &str,
+    presets: impl Iterator<Item = (String, u64)>,
+    current: u64,
+) -> Result<(Submenu, Vec<CheckMenuItem>)> {
+    let submenu = Submenu::new(title, true);
+    let mut items = Vec::new();
+    for (label, value) in presets {
+        let item = CheckMenuItem::with_id(
+            format!("{prefix}:{value}"),
+            label,
+            true,
+            value == current,
+            None,
+        );
+        submenu.append(&item)?;
+        items.push(item);
+    }
+    Ok((submenu, items))
+}
+
+/// Re-sync a preset submenu's checkmarks so exactly the item matching `value`
+/// is checked. muda auto-toggles the clicked item, so without this, clicking the
+/// already-active preset would leave it unchecked.
+fn set_preset(items: &[CheckMenuItem], prefix: &str, value: u64) {
+    let target = format!("{prefix}:{value}");
+    for item in items {
+        item.set_checked(item.id().0 == target);
     }
 }
 
@@ -151,13 +256,17 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     spawn_poll_worker(proxy.clone(), cmd_rx, cfg.poll_interval_seconds.max(5));
 
     let mut text_mode = cfg.text_mode();
-    let mut menu = MenuHandles::build(autostart_enabled, text_mode)?;
+    let mut menu = MenuHandles::build(&cfg, autostart_enabled, text_mode)?;
     menu.touch_ids();
 
     let initial_icon = icon::neutral_icon()?;
     let mut tray = build_tray_icon(&menu.root, initial_icon)?;
 
-    let mut notifier = Notifier::new(cfg.low_battery_threshold, cfg.low_battery_cooldown_minutes);
+    let mut notifier = Notifier::new(
+        cfg.notifications_enabled,
+        cfg.low_battery_threshold,
+        cfg.low_battery_cooldown_minutes,
+    );
     let mut devices: Vec<BatteryState> = Vec::new();
     let mut selected_id = cfg.selected_device_id.clone();
     // Number of consecutive polls that returned nothing. We keep showing the
@@ -204,6 +313,42 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                             text_mode,
                         ) {
                             tracing::warn!("failed updating tray: {err}");
+                        }
+                    } else if id == "notify" {
+                        // muda already toggled the check mark; read it directly.
+                        cfg.notifications_enabled = menu.notify_item.is_checked();
+                        notifier.set_enabled(cfg.notifications_enabled);
+                        if let Err(err) = config::save_config(&cfg) {
+                            tracing::warn!("failed saving config: {err}");
+                        }
+                    } else if id == "openconfig" {
+                        open_config_file();
+                    } else if let Some(value) = id.strip_prefix("poll:") {
+                        if let Ok(secs) = value.parse::<u64>() {
+                            cfg.poll_interval_seconds = secs;
+                            let _ = cmd_tx.send(WorkerCommand::SetInterval(secs));
+                            if let Err(err) = config::save_config(&cfg) {
+                                tracing::warn!("failed saving config: {err}");
+                            }
+                            set_preset(&menu.poll_items, "poll", secs);
+                        }
+                    } else if let Some(value) = id.strip_prefix("threshold:") {
+                        if let Ok(threshold) = value.parse::<u8>() {
+                            cfg.low_battery_threshold = threshold;
+                            notifier.set_threshold(threshold);
+                            if let Err(err) = config::save_config(&cfg) {
+                                tracing::warn!("failed saving config: {err}");
+                            }
+                            set_preset(&menu.threshold_items, "threshold", u64::from(threshold));
+                        }
+                    } else if let Some(value) = id.strip_prefix("cooldown:") {
+                        if let Ok(minutes) = value.parse::<u64>() {
+                            cfg.low_battery_cooldown_minutes = minutes;
+                            notifier.set_cooldown(minutes);
+                            if let Err(err) = config::save_config(&cfg) {
+                                tracing::warn!("failed saving config: {err}");
+                            }
+                            set_preset(&menu.cooldown_items, "cooldown", minutes);
                         }
                     } else if let Some(device_id) = id.strip_prefix("device:") {
                         selected_id = device_id.to_string();
@@ -350,6 +495,10 @@ fn spawn_poll_worker(
     poll_interval_seconds: u64,
 ) {
     thread::spawn(move || {
+        // Live-adjustable via WorkerCommand::SetInterval; always kept at the
+        // enforced 5s floor to avoid hammering the USB bus.
+        let mut poll_interval_seconds = poll_interval_seconds.max(5);
+
         // When a poll finds nothing we retry quickly, doubling the delay each
         // time (2s, 4s, 8s, …) up to the normal interval, so a sleeping or
         // not-yet-ready device is picked up fast without hammering the USB bus
@@ -396,12 +545,38 @@ fn spawn_poll_worker(
 
             match cmd_rx.recv_timeout(Duration::from_secs(wait)) {
                 Ok(WorkerCommand::Refresh) => continue,
+                Ok(WorkerCommand::SetInterval(secs)) => {
+                    poll_interval_seconds = secs.max(5);
+                    empty_backoff = EMPTY_RETRY_START_SECS;
+                    continue;
+                }
                 Ok(WorkerCommand::Exit) => break,
                 Err(mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
     });
+}
+
+/// Open the config file in the user's default editor. The file always exists by
+/// the time the tray runs (created by `load_or_create_config`).
+fn open_config_file() {
+    let path = config::config_path();
+    #[cfg(target_os = "windows")]
+    {
+        // explorer hands the file to its associated editor and, unlike `cmd
+        // /C start`, does so without flashing a console window.
+        if let Err(err) = std::process::Command::new("explorer").arg(&path).spawn() {
+            tracing::warn!("failed opening config file {}: {err}", path.display());
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        tracing::warn!(
+            "opening the config file is only supported on Windows: {}",
+            path.display()
+        );
+    }
 }
 
 fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Result<()> {

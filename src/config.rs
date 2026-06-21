@@ -16,10 +16,17 @@ pub struct AppConfig {
     /// Tray display style: "icon" (battery glyph) or "text" (percentage number).
     #[serde(default = "default_view_mode")]
     pub view_mode: String,
+    /// Whether low-battery toast notifications are shown at all.
+    #[serde(default = "default_notifications_enabled")]
+    pub notifications_enabled: bool,
 }
 
 fn default_view_mode() -> String {
     "icon".to_string()
+}
+
+fn default_notifications_enabled() -> bool {
+    true
 }
 
 impl AppConfig {
@@ -40,6 +47,7 @@ impl Default for AppConfig {
             autostart: false,
             log_level: "info".to_string(),
             view_mode: default_view_mode(),
+            notifications_enabled: default_notifications_enabled(),
         }
     }
 }
@@ -142,6 +150,7 @@ mod tests {
         assert_eq!(parsed.low_battery_threshold, cfg.low_battery_threshold);
         assert_eq!(parsed.autostart, cfg.autostart);
         assert_eq!(parsed.view_mode, cfg.view_mode);
+        assert_eq!(parsed.notifications_enabled, cfg.notifications_enabled);
     }
 
     #[test]

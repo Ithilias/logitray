@@ -3,22 +3,36 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 pub struct Notifier {
+    enabled: bool,
     threshold: u8,
     cooldown: Duration,
     last_sent: HashMap<String, Instant>,
 }
 
 impl Notifier {
-    pub fn new(threshold: u8, cooldown_minutes: u64) -> Self {
+    pub fn new(enabled: bool, threshold: u8, cooldown_minutes: u64) -> Self {
         Self {
+            enabled,
             threshold,
             cooldown: Duration::from_secs(cooldown_minutes.saturating_mul(60)),
             last_sent: HashMap::new(),
         }
     }
 
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    pub fn set_threshold(&mut self, threshold: u8) {
+        self.threshold = threshold;
+    }
+
+    pub fn set_cooldown(&mut self, cooldown_minutes: u64) {
+        self.cooldown = Duration::from_secs(cooldown_minutes.saturating_mul(60));
+    }
+
     fn should_notify(&self, state: &BatteryState, now: Instant) -> bool {
-        if state.is_charging || state.battery_percent > self.threshold {
+        if !self.enabled || state.is_charging || state.battery_percent > self.threshold {
             return false;
         }
 
@@ -128,19 +142,25 @@ mod tests {
 
     #[test]
     fn low_battery_ignored_while_charging() {
-        let mut notifier = Notifier::new(15, 120);
+        let mut notifier = Notifier::new(true, 15, 120);
         assert!(!notifier.maybe_notify_low_battery(&make_state(10, true)));
     }
 
     #[test]
     fn above_threshold_ignored() {
-        let mut notifier = Notifier::new(15, 120);
+        let mut notifier = Notifier::new(true, 15, 120);
         assert!(!notifier.maybe_notify_low_battery(&make_state(50, false)));
     }
 
     #[test]
+    fn disabled_suppresses_notifications() {
+        let notifier = Notifier::new(false, 15, 120);
+        assert!(!notifier.should_notify(&make_state(10, false), Instant::now()));
+    }
+
+    #[test]
     fn cooldown_suppresses_repeat() {
-        let mut notifier = Notifier::new(15, 120);
+        let mut notifier = Notifier::new(true, 15, 120);
         let state = make_state(10, false);
         let now = Instant::now();
         assert!(notifier.should_notify(&state, now));
