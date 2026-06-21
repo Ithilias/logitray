@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Verify tag matches Cargo.toml version
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}" -replace '^v', ''
+          $ver = (Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          if ($tag -ne $ver) {
+            Write-Error "Tag '$tag' does not match Cargo.toml version '$ver'"
+            exit 1
+          }
+          Write-Host "Tag matches Cargo.toml version: $ver"
+
+      - name: Test
+        run: cargo test --all-targets
+
+      - name: Build release
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package exe + checksum
+        shell: pwsh
+        run: |
+          Copy-Item target/x86_64-pc-windows-msvc/release/logitray.exe logitray.exe
+          $hash = (Get-FileHash logitray.exe -Algorithm SHA256).Hash.ToLower()
+          "$hash  logitray.exe" | Out-File -Encoding ascii -NoNewline logitray.exe.sha256
+
+      - name: Create or update GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "${{ github.ref_name }}"
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $tag logitray.exe logitray.exe.sha256 --clobber
+          } else {
+            gh release create $tag logitray.exe logitray.exe.sha256 --title $tag --generate-notes
+          }
