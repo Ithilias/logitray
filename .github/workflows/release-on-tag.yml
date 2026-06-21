@@ -33,6 +33,9 @@ jobs:
             exit 1
           fi
 
+      - name: Check formatting
+        run: cargo fmt --check
+
       - name: Test
         run: cargo test --all-targets
 
