@@ -37,7 +37,7 @@ impl Default for AppConfig {
             low_battery_threshold: 15,
             low_battery_cooldown_minutes: 120,
             selected_device_id: String::new(),
-            autostart: true,
+            autostart: false,
             log_level: "info".to_string(),
             view_mode: default_view_mode(),
         }
@@ -142,5 +142,10 @@ mod tests {
         assert_eq!(parsed.low_battery_threshold, cfg.low_battery_threshold);
         assert_eq!(parsed.autostart, cfg.autostart);
         assert_eq!(parsed.view_mode, cfg.view_mode);
+    }
+
+    #[test]
+    fn default_autostart_is_opt_in() {
+        assert!(!AppConfig::default().autostart);
     }
 }
