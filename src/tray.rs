@@ -1,12 +1,14 @@
 use crate::autostart;
 use crate::config::{self, AppConfig};
-use crate::hid::client;
+use crate::hid::client::{self, DeviceEvent, WorkerCommand};
+use crate::hid::scanner::scan_receivers;
 use crate::icon;
-use crate::model::{BatteryState, PollResult};
+use crate::model::BatteryState;
 use crate::notify::Notifier;
 use crate::APP_ID;
 use anyhow::{Context, Result};
 use hidapi::HidApi;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -18,13 +20,8 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 #[derive(Debug, Clone)]
 enum UserEvent {
     Menu(String),
-    Poll(PollResult),
-}
-
-enum WorkerCommand {
-    Refresh,
-    SetInterval(u64),
-    Exit,
+    /// An incremental device update or departure from a receiver worker.
+    Device(DeviceEvent),
 }
 
 /// Preset choices for the menu submenus. The numeric value is encoded into each
@@ -34,6 +31,7 @@ const POLL_PRESETS: &[(&str, u64)] = &[
     ("30 seconds", 30),
     ("1 minute", 60),
     ("2 minutes", 120),
+    ("3 minutes", 180),
     ("5 minutes", 300),
     ("15 minutes", 900),
 ];
@@ -251,9 +249,10 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
         }
     }));
 
+    // Commands are sent to the supervisor, which fans them out to the per-
+    // receiver workers (and spawns workers for receivers as they appear).
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
-
-    spawn_poll_worker(proxy.clone(), cmd_rx, cfg.poll_interval_seconds.max(5));
+    spawn_supervisor(proxy.clone(), cmd_rx, cfg.poll_interval_seconds);
 
     let mut text_mode = cfg.text_mode();
     let mut menu = MenuHandles::build(&cfg, autostart_enabled, text_mode)?;
@@ -267,14 +266,13 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
         cfg.low_battery_threshold,
         cfg.low_battery_cooldown_minutes,
     );
+    // Source of truth for what's currently connected, keyed by device_key. The
+    // workers push explicit arrival/update/departure events, so there's no need
+    // to infer absence from empty polls any more. `devices` is the sorted view
+    // of `device_map` that the menu/tray rendering consumes.
+    let mut device_map: BTreeMap<String, BatteryState> = BTreeMap::new();
     let mut devices: Vec<BatteryState> = Vec::new();
     let mut selected_id = cfg.selected_device_id.clone();
-    // Number of consecutive polls that returned nothing. We keep showing the
-    // last known reading through brief gaps (the mouse sleeping, a single
-    // enumeration timeout) and only blank the tray once the device has been
-    // missing for several poll cycles.
-    let mut missed_polls: u32 = 0;
-    const MAX_MISSED_POLLS: u32 = 3;
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -325,8 +323,11 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         open_config_file();
                     } else if let Some(value) = id.strip_prefix("poll:") {
                         if let Ok(secs) = value.parse::<u64>() {
+                            // Now controls the safety re-read interval: arrivals
+                            // and battery changes are pushed, so this only bounds
+                            // how often we re-read as a fallback.
                             cfg.poll_interval_seconds = secs;
-                            let _ = cmd_tx.send(WorkerCommand::SetInterval(secs));
+                            let _ = cmd_tx.send(WorkerCommand::SetSafetyInterval(secs));
                             if let Err(err) = config::save_config(&cfg) {
                                 tracing::warn!("failed saving config: {err}");
                             }
@@ -368,28 +369,19 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         }
                     }
                 }
-                UserEvent::Poll(mut poll_result) => {
-                    poll_result.sort_devices();
-                    let PollResult { devices: new_devices, errors } = poll_result;
-
-                    for err in errors {
-                        tracing::warn!("poll error: {err}");
-                    }
-
-                    // Keep the last known reading through brief gaps: a poll that
-                    // comes back empty while we still have devices is treated as a
-                    // transient miss until it persists for MAX_MISSED_POLLS cycles.
-                    if new_devices.is_empty() && !devices.is_empty() {
-                        missed_polls += 1;
-                        if missed_polls < MAX_MISSED_POLLS {
-                            tracing::debug!(
-                                "transient empty poll ({missed_polls}/{MAX_MISSED_POLLS}); keeping last reading"
-                            );
-                            return;
+                UserEvent::Device(event) => {
+                    match event {
+                        DeviceEvent::Update(state) => {
+                            // Notify on the fresh reading before it's moved into the map.
+                            notifier.maybe_notify_low_battery(&state);
+                            device_map.insert(state.device_key.clone(), state);
+                        }
+                        DeviceEvent::Gone(key) => {
+                            device_map.remove(&key);
                         }
                     }
-                    missed_polls = 0;
-                    devices = new_devices;
+
+                    devices = sorted_devices(&device_map);
 
                     if ensure_selected_device(&mut selected_id, &devices) {
                         cfg.selected_device_id = selected_id.clone();
@@ -409,10 +401,6 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         text_mode,
                     ) {
                         tracing::warn!("failed refreshing tray: {err}");
-                    }
-
-                    for device in &devices {
-                        notifier.maybe_notify_low_battery(device);
                     }
                 }
             }
@@ -484,75 +472,82 @@ fn ensure_selected_device(selected_id: &mut String, devices: &[BatteryState]) ->
     true
 }
 
-/// Shortest wait before re-polling after a poll that found no devices. The
-/// first reading at startup, or recovery after the mouse sleeps, shouldn't have
-/// to wait the full poll interval.
-const EMPTY_RETRY_START_SECS: u64 = 2;
+/// Sorted view of the current device map, matching the ordering the old
+/// `PollResult::sort_devices` produced (by name, then pid, then key).
+fn sorted_devices(map: &BTreeMap<String, BatteryState>) -> Vec<BatteryState> {
+    let mut devices: Vec<BatteryState> = map.values().cloned().collect();
+    devices.sort_by(|a, b| {
+        a.display_name
+            .cmp(&b.display_name)
+            .then(a.pid.cmp(&b.pid))
+            .then(a.device_key.cmp(&b.device_key))
+    });
+    devices
+}
 
-fn spawn_poll_worker(
+/// How often the supervisor re-scans for newly attached receivers. Workers for
+/// existing receivers keep running independently; this only governs detecting a
+/// receiver that was just plugged in (rare), so it can be relaxed.
+const RESCAN_SECS: u64 = 20;
+
+/// Supervise the per-receiver workers: spawn one for each receiver as it appears,
+/// prune workers whose receiver vanished, and fan out UI commands to all of them.
+fn spawn_supervisor(
     proxy: EventLoopProxy<UserEvent>,
     cmd_rx: mpsc::Receiver<WorkerCommand>,
-    poll_interval_seconds: u64,
+    safety_secs: u64,
 ) {
     thread::spawn(move || {
-        // Live-adjustable via WorkerCommand::SetInterval; always kept at the
-        // enforced 5s floor to avoid hammering the USB bus.
-        let mut poll_interval_seconds = poll_interval_seconds.max(5);
-
-        // When a poll finds nothing we retry quickly, doubling the delay each
-        // time (2s, 4s, 8s, …) up to the normal interval, so a sleeping or
-        // not-yet-ready device is picked up fast without hammering the USB bus
-        // forever when no device is present.
-        let mut empty_backoff = EMPTY_RETRY_START_SECS;
-
-        // Create the HidApi handle and feature cache once and reuse them across
-        // polls; `refresh_devices` picks up newly attached/removed receivers
-        // without a full re-enumeration. The handle is recreated lazily if it
-        // ever fails to initialize.
-        let mut api: Option<HidApi> = None;
-        let mut cache = client::FeatureCache::new();
+        // pid -> (command sender, join handle) for each live worker.
+        let mut workers: HashMap<u16, (mpsc::Sender<WorkerCommand>, thread::JoinHandle<()>)> =
+            HashMap::new();
+        let mut safety_secs = safety_secs;
 
         loop {
-            if api.is_none() {
-                match HidApi::new() {
-                    Ok(a) => api = Some(a),
-                    Err(err) => tracing::warn!("failed initializing hidapi: {err}"),
+            // Drop workers whose thread has exited (receiver unplugged), so a
+            // re-plugged receiver gets a fresh worker below.
+            workers.retain(|_, (_, handle)| !handle.is_finished());
+
+            // Spawn workers for any receiver we're not already tracking.
+            match HidApi::new() {
+                Ok(api) => {
+                    for receiver in scan_receivers(&api) {
+                        if workers.contains_key(&receiver.pid) {
+                            continue;
+                        }
+                        let (tx, rx) = mpsc::channel::<WorkerCommand>();
+                        let proxy = proxy.clone();
+                        let handle = client::spawn_receiver_worker(
+                            receiver.clone(),
+                            safety_secs,
+                            rx,
+                            move |event| {
+                                let _ = proxy.send_event(UserEvent::Device(event));
+                            },
+                        );
+                        workers.insert(receiver.pid, (tx, handle));
+                    }
                 }
+                Err(err) => tracing::warn!("failed initializing hidapi for scan: {err}"),
             }
 
-            let poll_result = match api.as_mut() {
-                Some(a) => {
-                    let _ = a.refresh_devices();
-                    client::poll_devices(a, &mut cache)
+            match cmd_rx.recv_timeout(Duration::from_secs(RESCAN_SECS)) {
+                Ok(WorkerCommand::Exit) => {
+                    for (tx, _) in workers.values() {
+                        let _ = tx.send(WorkerCommand::Exit);
+                    }
+                    return;
                 }
-                None => PollResult {
-                    devices: Vec::new(),
-                    errors: vec!["hidapi unavailable".to_string()],
-                },
-            };
-
-            let found = !poll_result.devices.is_empty();
-            let _ = proxy.send_event(UserEvent::Poll(poll_result));
-
-            let wait = if found {
-                empty_backoff = EMPTY_RETRY_START_SECS;
-                poll_interval_seconds
-            } else {
-                let w = empty_backoff.min(poll_interval_seconds);
-                empty_backoff = (empty_backoff * 2).min(poll_interval_seconds);
-                w
-            };
-
-            match cmd_rx.recv_timeout(Duration::from_secs(wait)) {
-                Ok(WorkerCommand::Refresh) => continue,
-                Ok(WorkerCommand::SetInterval(secs)) => {
-                    poll_interval_seconds = secs.max(5);
-                    empty_backoff = EMPTY_RETRY_START_SECS;
-                    continue;
+                Ok(cmd) => {
+                    if let WorkerCommand::SetSafetyInterval(secs) = cmd {
+                        safety_secs = secs;
+                    }
+                    for (tx, _) in workers.values() {
+                        let _ = tx.send(cmd.clone());
+                    }
                 }
-                Ok(WorkerCommand::Exit) => break,
-                Err(mpsc::RecvTimeoutError::Timeout) => continue,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => return,
             }
         }
     });

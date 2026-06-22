@@ -1,6 +1,7 @@
 use crate::APP_ID;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -40,7 +41,10 @@ impl AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            poll_interval_seconds: 60,
+            // Battery and charging changes are pushed via HID++ notifications, so
+            // this is only a backstop re-read for missed events / resume — a few
+            // minutes is plenty and keeps idle USB traffic low.
+            poll_interval_seconds: 180,
             low_battery_threshold: 15,
             low_battery_cooldown_minutes: 120,
             selected_device_id: String::new(),
@@ -137,9 +141,108 @@ pub fn save_config(cfg: &AppConfig) -> Result<()> {
     Ok(())
 }
 
+/// What we learned about a device the first time we enumerated it — which HID++
+/// 2.0 battery feature to use and its table index, plus the display name. This
+/// is the slow, multi-round-trip part of talking to a freshly-woken device, so
+/// we persist it keyed by wireless product id (WPID) and reuse it across boots:
+/// on the next cold start we can read the battery directly instead of running
+/// (and possibly failing) enumeration while the device is still half-asleep.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct DeviceProfile {
+    pub battery_feature_id: u16,
+    pub battery_feature_index: u8,
+    pub name: String,
+}
+
+/// Persisted map of WPID (lower-case hex, e.g. "4099") -> [`DeviceProfile`].
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct DeviceProfiles {
+    #[serde(default)]
+    pub devices: HashMap<String, DeviceProfile>,
+}
+
+impl DeviceProfiles {
+    /// Format a WPID as the map key.
+    pub fn key(wpid: u16) -> String {
+        format!("{wpid:04x}")
+    }
+
+    pub fn get(&self, wpid: u16) -> Option<&DeviceProfile> {
+        self.devices.get(&Self::key(wpid))
+    }
+
+    /// Insert/replace a profile, returning true if it changed (so the caller can
+    /// avoid a redundant disk write).
+    pub fn upsert(&mut self, wpid: u16, profile: DeviceProfile) -> bool {
+        match self.devices.get(&Self::key(wpid)) {
+            Some(existing)
+                if existing.battery_feature_id == profile.battery_feature_id
+                    && existing.battery_feature_index == profile.battery_feature_index
+                    && existing.name == profile.name =>
+            {
+                false
+            }
+            _ => {
+                self.devices.insert(Self::key(wpid), profile);
+                true
+            }
+        }
+    }
+}
+
+pub fn device_profiles_path() -> PathBuf {
+    app_data_dir().join("devices.toml")
+}
+
+/// Load the persisted device profiles, returning an empty set if the file is
+/// missing or unreadable — this is a best-effort cache, never a hard dependency.
+pub fn load_device_profiles() -> DeviceProfiles {
+    let path = device_profiles_path();
+    let Ok(raw) = fs::read_to_string(path) else {
+        return DeviceProfiles::default();
+    };
+    toml::from_str(&raw).unwrap_or_default()
+}
+
+pub fn save_device_profiles(profiles: &DeviceProfiles) -> Result<()> {
+    let raw = toml::to_string_pretty(profiles).context("failed serializing device profiles")?;
+    write_atomic(&device_profiles_path(), raw.as_bytes())?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::AppConfig;
+    use super::{AppConfig, DeviceProfile, DeviceProfiles};
+
+    #[test]
+    fn device_profiles_roundtrip_and_upsert() {
+        let mut profiles = DeviceProfiles::default();
+        assert!(profiles.upsert(
+            0x4099,
+            DeviceProfile {
+                battery_feature_id: 0x1001,
+                battery_feature_index: 6,
+                name: "G Pro".to_string(),
+            },
+        ));
+        // Re-inserting the identical profile reports "no change".
+        assert!(!profiles.upsert(
+            0x4099,
+            DeviceProfile {
+                battery_feature_id: 0x1001,
+                battery_feature_index: 6,
+                name: "G Pro".to_string(),
+            },
+        ));
+
+        let raw = toml::to_string_pretty(&profiles).expect("serialize profiles");
+        let parsed: DeviceProfiles = toml::from_str(&raw).expect("parse profiles");
+        let p = parsed.get(0x4099).expect("profile present after roundtrip");
+        assert_eq!(p.battery_feature_id, 0x1001);
+        assert_eq!(p.battery_feature_index, 6);
+        assert_eq!(p.name, "G Pro");
+        assert!(parsed.get(0x1234).is_none());
+    }
 
     #[test]
     fn config_toml_roundtrip() {

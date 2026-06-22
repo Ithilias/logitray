@@ -1,7 +1,6 @@
 use crate::config;
 use crate::hid::client;
 use anyhow::{Context, Result};
-use hidapi::HidApi;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -15,9 +14,7 @@ pub fn run_once() -> Result<()> {
     let cfg = config::load_or_create_config()?;
     init_logging(&cfg);
 
-    let api = HidApi::new().context("failed to initialize hidapi")?;
-    let mut cache = client::FeatureCache::new();
-    let result = client::poll_devices(&api, &mut cache);
+    let result = client::poll_once();
 
     if result.devices.is_empty() {
         println!("No supported Logitech devices found.");
