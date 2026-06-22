@@ -17,6 +17,90 @@ pub const MAX_RETRIES: usize = 5;
 /// receiver can take a few hundred ms, so keep this comfortably above that.
 pub const READ_TIMEOUT_MS: i32 = 500;
 
+/// Budget for *presence* pings during slot discovery. This is only the fallback
+/// path for receivers that don't push connection notifications — the primary
+/// path detects devices from the receiver's `0x41` connection notification and
+/// never pings. An idle device's round-trip through the receiver can exceed
+/// 150ms, so we keep this moderate (cheaper than the full data budget, generous
+/// enough to catch a linked-but-idle device) rather than aggressively short.
+pub const PING_TIMEOUT_MS: i32 = 300;
+pub const PING_RETRIES: usize = 2;
+
+/// Classification of an incoming HID++ report, used to route unsolicited
+/// notifications in the reader loop. Replies to our own pending requests are
+/// matched separately (by exact feature index + software id); this is for
+/// deciding what an *arriving* report means.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReportClass {
+    /// Reply to one of our HID++ 2.0 feature requests (software id == [`SW_ID`]).
+    Reply,
+    /// Reply/ack to a HID++ 1.0 register request (sub-id 0x80 set / 0x81 get).
+    RegisterReply { sub_id: u8 },
+    /// Unsolicited HID++ 2.0 feature event (software id nibble == 0).
+    FeatureEvent { device_index: u8, feature_index: u8 },
+    /// HID++ 1.0 device-connection notification (sub-id 0x41).
+    Connection { device_index: u8 },
+    /// Other HID++ 1.0 receiver notification (sub-id 0x40..=0x7F).
+    Notification { sub_id: u8 },
+    /// Error reply (1.0 sub-id 0x8F or 2.0 feature index 0xFF).
+    Error,
+}
+
+/// Normalize a raw HID read into the 7-byte HID++ header (report-id first).
+///
+/// hidapi on Windows may or may not prepend the report-id byte; a genuine HID++
+/// report starts with 0x10 (short) or 0x11 (long). Mirrors the inline logic that
+/// [`crate::hid::client`]'s `send_recv` has always used, factored out so the
+/// reader loop and `--diag` classify reports the same way. Returns `None` for
+/// reads too short to be a HID++ header.
+pub fn normalize_report(buf: &[u8], n: usize) -> Option<[u8; 7]> {
+    if n >= 8 && buf[0] != SHORT_REPORT_ID && buf[0] != LONG_REPORT_ID {
+        // report-id was prepended — skip it
+        Some(buf[1..8].try_into().unwrap())
+    } else if n >= 7 {
+        Some(buf[0..7].try_into().unwrap())
+    } else {
+        None
+    }
+}
+
+/// Classify a normalized 7-byte report (`[0]` = report id, `[1]` = device index,
+/// `[2]` = sub-id/feature index, `[3]` = register addr / `(function<<4)|swid`).
+///
+/// HID++ 1.0 (receiver) and 2.0 (device) share the wire frame, so we disambiguate
+/// by `report[2]`: error codes (0x8F/0xFF) and register replies (>=0x80) first,
+/// then receiver notifications (0x40..=0x7F, e.g. 0x41 connection), and finally
+/// the 2.0 case where the software-id nibble of `report[3]` tells reply (ours)
+/// from event (zero). Device feature indices for battery/root are small (<0x40),
+/// so they never collide with the 1.0 sub-id ranges.
+pub fn classify(report: &[u8; 7]) -> ReportClass {
+    let id_byte = report[2];
+    if id_byte == 0x8F || id_byte == 0xFF {
+        return ReportClass::Error;
+    }
+    if id_byte >= 0x80 {
+        return ReportClass::RegisterReply { sub_id: id_byte };
+    }
+    if id_byte >= 0x40 {
+        return if id_byte == 0x41 {
+            ReportClass::Connection {
+                device_index: report[1],
+            }
+        } else {
+            ReportClass::Notification { sub_id: id_byte }
+        };
+    }
+    match report[3] & 0x0F {
+        SW_ID => ReportClass::Reply,
+        0x00 => ReportClass::FeatureEvent {
+            device_index: report[1],
+            feature_index: report[2],
+        },
+        // A reply addressed to some other software id — not ours to act on.
+        other => ReportClass::Notification { sub_id: other },
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ShortMsg {
     pub device_index: u8,
@@ -189,5 +273,60 @@ mod tests {
         let msg = ShortMsg::new(1, 0, 0, [0, 0, 42]);
         let buf = msg.encode();
         assert_eq!(ShortMsg::sw_id(&buf), SW_ID);
+    }
+
+    #[test]
+    fn classify_distinguishes_report_kinds() {
+        // Reply to one of our 2.0 feature requests: small feature idx, function 0,
+        // software-id nibble == ours.
+        let reply = [LONG_REPORT_ID, 0x01, 0x06, SW_ID, 0, 0, 0];
+        assert_eq!(classify(&reply), ReportClass::Reply);
+
+        // Unsolicited 2.0 battery event: small feature idx, swid nibble == 0.
+        let event = [LONG_REPORT_ID, 0x01, 0x06, 0x00, 50, 0, 0];
+        assert_eq!(
+            classify(&event),
+            ReportClass::FeatureEvent {
+                device_index: 0x01,
+                feature_index: 0x06
+            }
+        );
+
+        // 1.0 device-connection notification.
+        let conn = [SHORT_REPORT_ID, 0x02, 0x41, 0xA1, 0x00, 0x12, 0x34];
+        assert_eq!(
+            classify(&conn),
+            ReportClass::Connection { device_index: 0x02 }
+        );
+
+        // 1.0 register get reply (sub-id 0x81).
+        let reg = [SHORT_REPORT_ID, 0xFF, 0x81, 0x02, 0x01, 0, 0];
+        assert_eq!(classify(&reg), ReportClass::RegisterReply { sub_id: 0x81 });
+
+        // Error replies.
+        let err10 = [SHORT_REPORT_ID, 0xFF, 0x8F, 0x00, 0x09, 0, 0];
+        assert_eq!(classify(&err10), ReportClass::Error);
+        let err20 = [LONG_REPORT_ID, 0x01, 0xFF, 0x06, 0x05, 0, 0];
+        assert_eq!(classify(&err20), ReportClass::Error);
+    }
+
+    #[test]
+    fn normalize_handles_prepended_report_id() {
+        // No prepend: buffer already starts with the report id.
+        let raw = [LONG_REPORT_ID, 0x01, 0x06, 0x0A, 1, 2, 3, 0];
+        assert_eq!(
+            normalize_report(&raw, 7),
+            Some([LONG_REPORT_ID, 0x01, 0x06, 0x0A, 1, 2, 3])
+        );
+
+        // Prepended byte (not a report id) ahead of a genuine 0x11 header.
+        let raw = [0x00, LONG_REPORT_ID, 0x01, 0x06, 0x0A, 1, 2, 3];
+        assert_eq!(
+            normalize_report(&raw, 8),
+            Some([LONG_REPORT_ID, 0x01, 0x06, 0x0A, 1, 2, 3])
+        );
+
+        // Too short to be a header.
+        assert_eq!(normalize_report(&[0x11, 0x01], 2), None);
     }
 }

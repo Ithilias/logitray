@@ -5,8 +5,11 @@
 //!   2. what `scan_receivers` actually matches
 //!   3. whether each 0xFF00 interface answers a HID++ ping on indices 1..=6
 
-use crate::hid::protocol::{ping, READ_TIMEOUT_MS, SHORT_REPORT_ID};
-use crate::hid::scanner::{scan_receivers, LOGITECH_VID};
+use crate::hid::protocol::{self, ping, READ_TIMEOUT_MS, SHORT_REPORT_ID};
+use crate::hid::receiver;
+use crate::hid::scanner::{
+    open_notifier, open_receiver, scan_receivers, ReceiverPath, LOGITECH_VID,
+};
 use hidapi::HidApi;
 
 const HIDPP_USAGE_PAGE: u16 = 0xFF00;
@@ -47,7 +50,15 @@ pub fn run_diag() {
         println!("(none matched VID 0x046D + usage_page 0x{HIDPP_USAGE_PAGE:04X})");
     } else {
         for r in &receivers {
-            println!("PID {:04X}  path={}", r.pid, r.path.to_string_lossy());
+            println!(
+                "PID {:04X}\n   long  (0x0002) = {}\n   short (0x0001) = {}",
+                r.pid,
+                r.long_path.to_string_lossy(),
+                r.short_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "<none>".to_string()),
+            );
         }
     }
 
@@ -140,6 +151,81 @@ pub fn run_diag() {
                 }
                 Err(err) => println!("   index {device_index}: read failed: {err}"),
             }
+        }
+    }
+
+    notification_probe(&api, &receivers);
+}
+
+/// Probe the receiver's short collection (usage 0x0001), where HID++ 1.0
+/// registers and the device-connection notification live. Enable notifications,
+/// read the connected count, ask the receiver to re-announce, then dump and
+/// classify reports for ~10s. A `Connection { .. }` here is the instant
+/// device-arrival signal the tray uses; battery is then read on the long
+/// collection. If the short collection is absent or silent, the app falls back
+/// to the fast ping sweep + periodic safety re-read.
+fn notification_probe(api: &HidApi, receivers: &[ReceiverPath]) {
+    println!("\n=== Notification probe (short collection: enable + announce, listen ~10s) ===");
+    for recv in receivers {
+        println!("\n-- PID {:04X}", recv.pid);
+        let dev = match open_notifier(api, recv) {
+            Ok(dev) => dev,
+            Err(err) => {
+                println!("   {err}");
+                continue;
+            }
+        };
+
+        match receiver::enable_notifications(&dev) {
+            Ok(()) => println!("   enable_notifications: OK"),
+            Err(err) => println!("   enable_notifications: FAILED ({err})"),
+        }
+        match receiver::connected_count(&dev) {
+            Ok(count) => println!("   connected_count: {count}"),
+            Err(err) => println!("   connected_count: unavailable ({err})"),
+        }
+        match receiver::poke_announce(&dev) {
+            Ok(()) => println!("   poke_announce: sent"),
+            Err(err) => println!("   poke_announce: FAILED ({err})"),
+        }
+
+        // Also watch the long collection, where any unsolicited HID++ 2.0 battery
+        // event would arrive. Toggle the charger during the listen window to see
+        // whether the device pushes anything (and on which interface).
+        let long = open_receiver(api, recv).ok();
+
+        println!("   listening ~35s on SHORT + LONG — toggle the charger now...");
+        let mut got_anything = false;
+        for _ in 0..70 {
+            for (label, handle) in [Some(("short", &dev)), long.as_ref().map(|l| ("long", l))]
+                .into_iter()
+                .flatten()
+            {
+                let mut buf = [0u8; 21];
+                match handle.read_timeout(&mut buf, 250) {
+                    Ok(0) => {}
+                    Ok(n) => {
+                        got_anything = true;
+                        let hex: Vec<String> =
+                            buf[..n].iter().map(|b| format!("{b:02X}")).collect();
+                        let class = match protocol::normalize_report(&buf, n) {
+                            Some(r) => {
+                                let mut s = format!("{:?}", protocol::classify(&r));
+                                if let Some(c) = receiver::parse_connection(&r) {
+                                    s = format!("{s}  {c:?}");
+                                }
+                                s
+                            }
+                            None => "<runt>".to_string(),
+                        };
+                        println!("   [{label}] n={n} [{}]  -> {class}", hex.join(" "));
+                    }
+                    Err(err) => println!("   [{label}] read failed: {err}"),
+                }
+            }
+        }
+        if !got_anything {
+            println!("   (no reports — receiver does not push notifications)");
         }
     }
 }
