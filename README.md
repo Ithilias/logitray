@@ -4,7 +4,7 @@ A tiny Windows tray app that shows your wireless Logitech mouse's battery level 
 
 ## What it does
 
-logitray sits in your system tray and talks to your Logitech wireless mouse directly over the HID++ 2.0 protocol through its USB receiver. It polls the battery in the background, shows the level on the tray icon, and pops a Windows notification when the battery gets low — all without any Logitech software running.
+logitray sits in your system tray and talks to your Logitech wireless mouse directly over the HID++ protocol through its USB receiver. It listens for the receiver's notifications, so battery, charging, and connect/disconnect changes show up on the tray icon within about a second (with a periodic re-read as a backstop), and it pops a Windows notification when the battery gets low — all without any Logitech software running.
 
 ## Features
 
@@ -16,7 +16,7 @@ logitray sits in your system tray and talks to your Logitech wireless mouse dire
 - Multiple devices: pick which one the tray follows
 - Manual "Refresh now" any time
 - Optional autostart with Windows
-- Resilient polling: keeps showing the last reading through brief dropouts (e.g. the mouse sleeping) and recovers quickly
+- Event-driven: connect, disconnect, charging, and battery-level changes are pushed by the receiver and reflected within ~1s — no busy polling, near-zero idle USB traffic, with a periodic re-read as a backstop
 
 ## Install & run
 
@@ -32,7 +32,7 @@ Right-click the icon for the menu:
 
 - **Status line** — the selected device and its battery (e.g. `G502 X Plus: 76%`)
 - **Select Device** — choose which device the tray follows when more than one is paired
-- **Refresh now** — poll immediately instead of waiting for the next interval
+- **Refresh now** — re-check all devices immediately instead of waiting for the backstop re-read
 - **Show percentage as text** — toggle between the battery-glyph icon and the percentage-number icon
 - **Start at login** — register/unregister autostart with Windows
 - **Exit**
@@ -55,13 +55,15 @@ Configuration lives in `%APPDATA%\logitray\config.toml` (created on first run):
 
 | Key | Default | Description |
 | --- | --- | --- |
-| `poll_interval_seconds` | `60` | How often to poll the battery |
+| `poll_interval_seconds` | `180` | Backstop re-read interval. Battery/charging changes are pushed via notifications; this only bounds the fallback re-read (and recovery after sleep). |
 | `low_battery_threshold` | `15` | Percent at/below which a low-battery toast fires |
 | `low_battery_cooldown_minutes` | `120` | Minimum time between repeat alerts per device |
 | `selected_device_id` | `""` | Which device the tray follows (set via the menu) |
 | `autostart` | `false` | Start logitray when you log in |
 | `log_level` | `"info"` | Log verbosity (`error`/`warn`/`info`/`debug`/`trace`) |
 | `view_mode` | `"icon"` | Tray display: `icon` (battery glyph) or `text` (percentage) |
+
+Enumerated device details (which battery feature to use, the device name) are cached per device in `%APPDATA%\logitray\devices.toml` so cold starts can skip the slower HID++ feature enumeration. It's safe to delete — it rebuilds itself.
 
 Logs are written to `%APPDATA%\logitray\logitray.log` (rotated, last few kept).
 
@@ -81,7 +83,7 @@ Build from source with [Rust](https://rustup.rs/):
 cargo build --release          # build
 cargo run                      # start the tray app
 cargo run -- --once            # print battery level to stdout
-cargo run -- --diag            # dump HID++ interfaces + ping results (hardware debugging)
+cargo run -- --diag            # dump HID++ interfaces, ping results + notification probe (hardware debugging)
 ```
 
 The release binary and CI build with the **MSVC** toolchain (`x86_64-pc-windows-msvc`), which works out of the box on `windows-latest`. To build locally with the **GNU** toolchain instead, you also need a full MinGW-w64 on `PATH` (the `windows` crates invoke `dlltool`/`as`, which rustup's bundled MinGW does not fully provide).
