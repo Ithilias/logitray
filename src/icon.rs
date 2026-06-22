@@ -67,7 +67,7 @@ fn draw_number(pixels: &mut [u8], label: &str, color: [u8; 4]) {
     // Glyph cell is 3 units wide; 1 unit gap between glyphs. Fit to canvas
     // (minus 1px padding each side) in both axes and pick the largest scale.
     let units_w = 3 * n + (n - 1);
-    let scale = ((TEXT_SIZE - 2) / units_w).min((TEXT_SIZE - 2) / 5).max(1);
+    let scale = ((TEXT_SIZE - 2) / units_w).clamp(1, (TEXT_SIZE - 2) / 5);
     let total_w = units_w * scale;
     let total_h = 5 * scale;
     let x0 = (TEXT_SIZE - total_w) / 2;
