@@ -1,8 +1,10 @@
+use crate::i18n::Language;
 use crate::model::BatteryState;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 pub struct Notifier {
+    language: Language,
     enabled: bool,
     threshold: u8,
     cooldown: Duration,
@@ -10,13 +12,18 @@ pub struct Notifier {
 }
 
 impl Notifier {
-    pub fn new(enabled: bool, threshold: u8, cooldown_minutes: u64) -> Self {
+    pub fn new(language: Language, enabled: bool, threshold: u8, cooldown_minutes: u64) -> Self {
         Self {
+            language,
             enabled,
             threshold,
             cooldown: Duration::from_secs(cooldown_minutes.saturating_mul(60)),
             last_sent: HashMap::new(),
         }
+    }
+
+    pub fn set_language(&mut self, language: Language) {
+        self.language = language;
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
@@ -51,7 +58,7 @@ impl Notifier {
             return false;
         }
 
-        if send_toast_low_battery(state).is_ok() {
+        if send_toast_low_battery(state, self.language).is_ok() {
             self.last_sent.insert(state.device_key.clone(), now);
             return true;
         }
@@ -61,13 +68,13 @@ impl Notifier {
 }
 
 #[cfg(target_os = "windows")]
-fn send_toast_low_battery(state: &BatteryState) -> anyhow::Result<()> {
+fn send_toast_low_battery(state: &BatteryState, language: Language) -> anyhow::Result<()> {
     use tauri_winrt_notification::Toast;
     let app_id = toast_app_id();
 
     Toast::new(app_id)
         .title(&low_battery_title(state))
-        .text1("Battery low — plug in charger soon")
+        .text1(language.text(crate::i18n::Text::LowBattery))
         .show()?;
 
     Ok(())
@@ -115,7 +122,7 @@ fn register_toast_aumid() -> anyhow::Result<()> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn send_toast_low_battery(_state: &BatteryState) -> anyhow::Result<()> {
+fn send_toast_low_battery(_state: &BatteryState, _language: Language) -> anyhow::Result<()> {
     Ok(())
 }
 
@@ -126,6 +133,7 @@ fn low_battery_title(state: &BatteryState) -> String {
 #[cfg(test)]
 mod tests {
     use super::{low_battery_title, Notifier};
+    use crate::i18n::Language;
     use crate::model::BatteryState;
     use std::time::{Duration, Instant};
 
@@ -142,25 +150,25 @@ mod tests {
 
     #[test]
     fn low_battery_ignored_while_charging() {
-        let mut notifier = Notifier::new(true, 15, 120);
+        let mut notifier = Notifier::new(Language::English, true, 15, 120);
         assert!(!notifier.maybe_notify_low_battery(&make_state(10, true)));
     }
 
     #[test]
     fn above_threshold_ignored() {
-        let mut notifier = Notifier::new(true, 15, 120);
+        let mut notifier = Notifier::new(Language::English, true, 15, 120);
         assert!(!notifier.maybe_notify_low_battery(&make_state(50, false)));
     }
 
     #[test]
     fn disabled_suppresses_notifications() {
-        let notifier = Notifier::new(false, 15, 120);
+        let notifier = Notifier::new(Language::English, false, 15, 120);
         assert!(!notifier.should_notify(&make_state(10, false), Instant::now()));
     }
 
     #[test]
     fn cooldown_suppresses_repeat() {
-        let mut notifier = Notifier::new(true, 15, 120);
+        let mut notifier = Notifier::new(Language::English, true, 15, 120);
         let state = make_state(10, false);
         let now = Instant::now();
         assert!(notifier.should_notify(&state, now));

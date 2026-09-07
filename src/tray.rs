@@ -2,6 +2,7 @@ use crate::autostart;
 use crate::config::{self, AppConfig};
 use crate::hid::client::{self, DeviceEvent, WorkerCommand};
 use crate::hid::scanner::scan_receivers;
+use crate::i18n::{Language, Text};
 use crate::icon;
 use crate::model::BatteryState;
 use crate::notify::Notifier;
@@ -26,26 +27,34 @@ enum UserEvent {
 
 /// Preset choices for the menu submenus. The numeric value is encoded into each
 /// item's id (e.g. "poll:60") so the event handler can parse it back.
-const POLL_PRESETS: &[(&str, u64)] = &[
-    ("15 seconds", 15),
-    ("30 seconds", 30),
-    ("1 minute", 60),
-    ("2 minutes", 120),
-    ("3 minutes", 180),
-    ("5 minutes", 300),
-    ("15 minutes", 900),
+const POLL_PRESETS: &[(Text, u64)] = &[
+    (Text::Seconds15, 15),
+    (Text::Seconds30, 30),
+    (Text::Minute1, 60),
+    (Text::Minutes2, 120),
+    (Text::Minutes3, 180),
+    (Text::Minutes5, 300),
+    (Text::Minutes15, 900),
 ];
 const THRESHOLD_PRESETS: &[u8] = &[5, 10, 15, 20, 25, 30];
-const COOLDOWN_PRESETS: &[(&str, u64)] = &[
-    ("30 minutes", 30),
-    ("1 hour", 60),
-    ("2 hours", 120),
-    ("4 hours", 240),
-    ("8 hours", 480),
+const COOLDOWN_PRESETS: &[(Text, u64)] = &[
+    (Text::Minutes30, 30),
+    (Text::Hour1, 60),
+    (Text::Hours2, 120),
+    (Text::Hours4, 240),
+    (Text::Hours8, 480),
+];
+/// Language submenu choices in menu order. Each item's id is `"language:{id}"`,
+/// where `id` matches the serialized `language` config value.
+const LANGUAGE_CHOICES: &[(&str, Language)] = &[
+    ("auto", Language::Auto),
+    ("en", Language::English),
+    ("zh-CN", Language::SimplifiedChinese),
 ];
 
 struct MenuHandles {
     root: Menu,
+    language: Language,
     status_item: MenuItem,
     select_submenu: Submenu,
     refresh_item: MenuItem,
@@ -55,6 +64,7 @@ struct MenuHandles {
     open_config_item: MenuItem,
     exit_item: MenuItem,
     device_items: Vec<CheckMenuItem>,
+    language_items: Vec<CheckMenuItem>,
     poll_items: Vec<CheckMenuItem>,
     threshold_items: Vec<CheckMenuItem>,
     cooldown_items: Vec<CheckMenuItem>,
@@ -62,35 +72,36 @@ struct MenuHandles {
 
 impl MenuHandles {
     fn build(cfg: &AppConfig, initial_autostart: bool, initial_text_mode: bool) -> Result<Self> {
+        let language = cfg.language.resolve();
         let root = Menu::new();
-        let status_item = MenuItem::new("No Logitech devices found", false, None);
-        let select_submenu = Submenu::new("Select Device", true);
-        let refresh_item = MenuItem::with_id("refresh", "Refresh now", true, None);
+        let status_item = MenuItem::new(language.text(Text::NoDevicesFound), false, None);
+        let select_submenu = Submenu::new(language.text(Text::SelectDevice), true);
+        let refresh_item = MenuItem::with_id("refresh", language.text(Text::Refresh), true, None);
         let view_mode_item = CheckMenuItem::with_id(
             "viewmode",
-            "Show percentage as text",
+            language.text(Text::TextMode),
             true,
             initial_text_mode,
             None,
         );
 
         let (poll_submenu, poll_items) = build_preset_submenu(
-            "Poll interval",
+            language.text(Text::PollInterval),
             "poll",
             POLL_PRESETS
                 .iter()
-                .map(|&(label, value)| (label.to_string(), value)),
+                .map(|&(label, value)| (language.text(label).to_string(), value)),
             cfg.poll_interval_seconds,
         )?;
         let notify_item = CheckMenuItem::with_id(
             "notify",
-            "Enable low-battery notifications",
+            language.text(Text::Notifications),
             true,
             cfg.notifications_enabled,
             None,
         );
         let (threshold_submenu, threshold_items) = build_preset_submenu(
-            "Low battery alert at",
+            language.text(Text::Threshold),
             "threshold",
             THRESHOLD_PRESETS
                 .iter()
@@ -98,18 +109,43 @@ impl MenuHandles {
             u64::from(cfg.low_battery_threshold),
         )?;
         let (cooldown_submenu, cooldown_items) = build_preset_submenu(
-            "Reminder interval",
+            language.text(Text::Cooldown),
             "cooldown",
             COOLDOWN_PRESETS
                 .iter()
-                .map(|&(label, value)| (label.to_string(), value)),
+                .map(|&(label, value)| (language.text(label).to_string(), value)),
             cfg.low_battery_cooldown_minutes,
         )?;
 
-        let autostart_item =
-            CheckMenuItem::with_id("autostart", "Start at login", true, initial_autostart, None);
-        let open_config_item = MenuItem::with_id("openconfig", "Open config file…", true, None);
-        let exit_item = MenuItem::with_id("exit", "Exit", true, None);
+        let autostart_item = CheckMenuItem::with_id(
+            "autostart",
+            language.text(Text::Autostart),
+            true,
+            initial_autostart,
+            None,
+        );
+        let open_config_item =
+            MenuItem::with_id("openconfig", language.text(Text::OpenConfig), true, None);
+        let exit_item = MenuItem::with_id("exit", language.text(Text::Exit), true, None);
+
+        let languages = Submenu::new(language.text(Text::Language), true);
+        let mut language_items = Vec::new();
+        for &(id, choice) in LANGUAGE_CHOICES {
+            let label = match choice {
+                Language::Auto => language.text(Text::Automatic),
+                Language::English => "English",
+                Language::SimplifiedChinese => "简体中文",
+            };
+            let item = CheckMenuItem::with_id(
+                format!("language:{id}"),
+                label,
+                true,
+                cfg.language == choice,
+                None,
+            );
+            languages.append(&item)?;
+            language_items.push(item);
+        }
 
         root.append_items(&[
             &status_item,
@@ -117,6 +153,7 @@ impl MenuHandles {
             &refresh_item,
             &PredefinedMenuItem::separator(),
             &view_mode_item,
+            &languages,
             &poll_submenu,
             &notify_item,
             &threshold_submenu,
@@ -130,6 +167,7 @@ impl MenuHandles {
 
         Ok(Self {
             root,
+            language,
             status_item,
             select_submenu,
             refresh_item,
@@ -139,6 +177,7 @@ impl MenuHandles {
             open_config_item,
             exit_item,
             device_items: Vec::new(),
+            language_items,
             poll_items,
             threshold_items,
             cooldown_items,
@@ -146,13 +185,14 @@ impl MenuHandles {
     }
 
     fn rebuild_device_menu(&mut self, devices: &[BatteryState], selected_id: &str) -> Result<()> {
+        let language = self.language;
         for item in self.select_submenu.items() {
             remove_item(&self.select_submenu, &item)?;
         }
         self.device_items.clear();
 
         if devices.is_empty() {
-            let empty = MenuItem::new("No devices", false, None);
+            let empty = MenuItem::new(language.text(Text::NoDevices), false, None);
             self.select_submenu.append(&empty)?;
             return Ok(());
         }
@@ -160,11 +200,11 @@ impl MenuHandles {
         for device in devices {
             let checked = device.device_key == selected_id;
             let label = format!(
-                "{} — {}{}",
+                "{}: {}{}",
                 device.display_name,
                 device.battery_percent,
                 if device.is_charging {
-                    "% (charging)"
+                    language.text(Text::Charging)
                 } else {
                     "%"
                 }
@@ -231,6 +271,21 @@ fn set_preset(items: &[CheckMenuItem], prefix: &str, value: u64) {
     }
 }
 
+/// Re-sync the Language submenu's checkmarks to `language`. Needed when a
+/// switch fails, because muda has already toggled the clicked item by then.
+fn set_language_choice(items: &[CheckMenuItem], language: Language) {
+    for (item, &(_, choice)) in items.iter().zip(LANGUAGE_CHOICES) {
+        item.set_checked(choice == language);
+    }
+}
+
+fn language_for_id(id: &str) -> Option<Language> {
+    LANGUAGE_CHOICES
+        .iter()
+        .find(|(choice_id, _)| *choice_id == id)
+        .map(|&(_, language)| language)
+}
+
 pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     let exe_path = std::env::current_exe().context("failed resolving executable path")?;
     if let Err(err) = autostart::set_enabled(&exe_path, cfg.autostart) {
@@ -262,10 +317,26 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     let mut tray = build_tray_icon(&menu.root, initial_icon)?;
 
     let mut notifier = Notifier::new(
+        menu.language,
         cfg.notifications_enabled,
         cfg.low_battery_threshold,
         cfg.low_battery_cooldown_minutes,
     );
+    // Localize the tooltip and the device submenu placeholder before the first
+    // device event arrives.
+    if let Err(err) = refresh_tray_visuals(
+        &mut tray,
+        &[],
+        "",
+        &menu.status_item,
+        text_mode,
+        menu.language,
+    ) {
+        tracing::warn!("failed initializing tray: {err}");
+    }
+    if let Err(err) = menu.rebuild_device_menu(&[], "") {
+        tracing::warn!("failed initializing device menu: {err}");
+    }
     // Source of truth for what's currently connected, keyed by device_key. The
     // workers push explicit arrival/update/departure events, so there's no need
     // to infer absence from empty polls any more. `devices` is the sorted view
@@ -309,6 +380,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                             &selected_id,
                             &menu.status_item,
                             text_mode,
+                            menu.language,
                         ) {
                             tracing::warn!("failed updating tray: {err}");
                         }
@@ -318,6 +390,46 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         notifier.set_enabled(cfg.notifications_enabled);
                         if let Err(err) = config::save_config(&cfg) {
                             tracing::warn!("failed saving config: {err}");
+                        }
+                    } else if let Some(choice) = id.strip_prefix("language:") {
+                        let mut next_config = cfg.clone();
+                        next_config.language = match language_for_id(choice) {
+                            Some(language) => language,
+                            None => return,
+                        };
+                        let rebuilt = MenuHandles::build(
+                            &next_config,
+                            menu.autostart_item.is_checked(),
+                            text_mode,
+                        )
+                        .and_then(|mut replacement| {
+                            replacement.rebuild_device_menu(&devices, &selected_id)?;
+                            Ok(replacement)
+                        });
+                        match rebuilt {
+                            Ok(replacement) => {
+                                cfg = next_config;
+                                tray.set_menu(Some(Box::new(replacement.root.clone())));
+                                menu = replacement;
+                                notifier.set_language(menu.language);
+                                if let Err(err) = refresh_tray_visuals(
+                                    &mut tray,
+                                    &devices,
+                                    &selected_id,
+                                    &menu.status_item,
+                                    text_mode,
+                                    menu.language,
+                                ) {
+                                    tracing::warn!("failed updating translated tray: {err}");
+                                }
+                                if let Err(err) = config::save_config(&cfg) {
+                                    tracing::warn!("failed saving config: {err}");
+                                }
+                            }
+                            Err(err) => {
+                                tracing::warn!("failed changing language: {err}");
+                                set_language_choice(&menu.language_items, cfg.language);
+                            }
                         }
                     } else if id == "openconfig" {
                         open_config_file();
@@ -364,6 +476,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                             &selected_id,
                             &menu.status_item,
                             text_mode,
+                            menu.language,
                         ) {
                             tracing::warn!("failed updating tray: {err}");
                         }
@@ -399,6 +512,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         &selected_id,
                         &menu.status_item,
                         text_mode,
+                        menu.language,
                     ) {
                         tracing::warn!("failed refreshing tray: {err}");
                     }
@@ -423,6 +537,7 @@ fn refresh_tray_visuals(
     selected_id: &str,
     status_item: &MenuItem,
     text_mode: bool,
+    language: Language,
 ) -> Result<()> {
     let selected = devices.iter().find(|d| d.device_key == selected_id);
 
@@ -439,7 +554,7 @@ fn refresh_tray_visuals(
             device.display_name,
             device.battery_percent,
             if device.is_charging {
-                "% (charging)"
+                language.text(Text::Charging)
             } else {
                 "%"
             }
@@ -448,8 +563,8 @@ fn refresh_tray_visuals(
         status_item.set_text(&tooltip);
     } else {
         tray.set_icon(Some(icon::neutral_icon()?))?;
-        tray.set_tooltip(Some("No Logitech devices found"))?;
-        status_item.set_text("No Logitech devices found");
+        tray.set_tooltip(Some(language.text(Text::NoDevicesFound)))?;
+        status_item.set_text(language.text(Text::NoDevicesFound));
     }
 
     Ok(())

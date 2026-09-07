@@ -21,7 +21,7 @@ pub fn run_once() -> Result<()> {
     } else {
         for dev in &result.devices {
             println!(
-                "{} — {}{}",
+                "{}: {}{}",
                 dev.display_name,
                 dev.battery_percent,
                 if dev.is_charging { "% (charging)" } else { "%" }

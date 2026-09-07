@@ -34,10 +34,23 @@ Right-click the icon for the menu:
 - **Select Device** — choose which device the tray follows when more than one is paired
 - **Refresh now** — re-check all devices immediately instead of waiting for the backstop re-read
 - **Show percentage as text** — toggle between the battery-glyph icon and the percentage-number icon
+- **Language** — Automatic (Windows display language), English, or 简体中文
 - **Start at login** — register/unregister autostart with Windows
 - **Exit**
 
 Icon colors: **green** ≥ 36%, **orange** 16–35%, **red** ≤ 15%, **blue** while charging.
+
+## Language
+
+The tray menu, tooltips, and battery notifications support English and Simplified Chinese.
+By default, logitray detects the Windows display language at startup. Simplified Chinese
+(Mainland China and Singapore) selects Chinese; unsupported languages, including
+Traditional Chinese, fall back to English.
+
+Choose **Language → Automatic (Windows language)**, **English**, or **简体中文** in the
+tray menu. Changes apply immediately and are saved. Choosing Automatic reads the current
+Windows display language again. Device names remain as reported by the device.
+CLI diagnostics and logs remain in English.
 
 ## Low-battery alerts
 
@@ -61,6 +74,7 @@ Configuration lives in `%APPDATA%\logitray\config.toml` (created on first run):
 | `selected_device_id` | `""` | Which device the tray follows (set via the menu) |
 | `autostart` | `false` | Start logitray when you log in |
 | `log_level` | `"info"` | Log verbosity (`error`/`warn`/`info`/`debug`/`trace`) |
+| `language` | `"auto"` | UI language: `auto` (Windows display language), `en`, or `zh-CN`. Unknown values fall back to English. |
 | `view_mode` | `"icon"` | Tray display: `icon` (battery glyph) or `text` (percentage) |
 
 Enumerated device details (which battery feature to use, the device name) are cached per device in `%APPDATA%\logitray\devices.toml` so cold starts can skip the slower HID++ feature enumeration. It's safe to delete — it rebuilds itself.
