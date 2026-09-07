@@ -215,15 +215,11 @@ impl MenuHandles {
 
         for device in devices {
             let checked = device.device_key == selected_id;
-            let label = format!(
-                "{}: {}{}",
-                device.display_name,
+            let label = battery_label(
+                language,
+                &device.display_name,
                 device.battery_percent,
-                if device.is_charging {
-                    language.text(Text::Charging)
-                } else {
-                    "%"
-                }
+                device.is_charging,
             );
             let item = CheckMenuItem::with_id(
                 format!("device:{}", device.device_key),
@@ -303,6 +299,19 @@ fn set_preset(items: &[CheckMenuItem], prefix: &str, value: u64) {
 
 fn update_label(language: Language, version: Version) -> String {
     format!("{}{version}", language.text(Text::UpdateAvailable))
+}
+
+/// The `G502 X PLUS: 46%` label shared by the tray tooltip, the status line and
+/// the device submenu, so the three cannot drift apart. Both unit strings come
+/// from the string table, so a future language can space or place the percent
+/// sign the way its typography wants.
+fn battery_label(language: Language, name: &str, percent: u8, charging: bool) -> String {
+    let unit = language.text(if charging {
+        Text::Charging
+    } else {
+        Text::Percent
+    });
+    format!("{name}: {percent}{unit}")
 }
 
 /// Re-sync the Language submenu's checkmarks to `language`. Needed when a
@@ -631,15 +640,11 @@ fn refresh_tray_visuals(
         };
         tray.set_icon(Some(icon))?;
 
-        let tooltip = format!(
-            "{}: {}{}",
-            device.display_name,
+        let tooltip = battery_label(
+            language,
+            &device.display_name,
             device.battery_percent,
-            if device.is_charging {
-                language.text(Text::Charging)
-            } else {
-                "%"
-            }
+            device.is_charging,
         );
         tray.set_tooltip(Some(tooltip.clone()))?;
         status_item.set_text(&tooltip);
@@ -769,7 +774,8 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_selected_device;
+    use super::{battery_label, ensure_selected_device};
+    use crate::i18n::Language;
     use crate::model::BatteryState;
 
     fn mk(id: &str) -> BatteryState {
@@ -797,5 +803,24 @@ mod tests {
         let mut selected = "b".to_string();
         assert!(!ensure_selected_device(&mut selected, &devices));
         assert_eq!(selected, "b");
+    }
+
+    #[test]
+    fn battery_label_composes_unit_from_the_string_table() {
+        let actual: Vec<_> = [Language::English, Language::SimplifiedChinese]
+            .into_iter()
+            .flat_map(|language| {
+                [false, true].map(|charging| battery_label(language, "G502 X PLUS", 46, charging))
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                "G502 X PLUS: 46%",
+                "G502 X PLUS: 46% (charging)",
+                "G502 X PLUS: 46%",
+                "G502 X PLUS: 46%（充电中）",
+            ]
+        );
     }
 }
