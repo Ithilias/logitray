@@ -81,6 +81,28 @@ fn send_toast_low_battery(state: &BatteryState, language: Language) -> anyhow::R
 }
 
 #[cfg(target_os = "windows")]
+pub fn send_toast_update_available(title: &str, language: Language) -> anyhow::Result<()> {
+    use crate::i18n::Text;
+    use tauri_winrt_notification::Toast;
+
+    Toast::new(toast_app_id())
+        .title(title)
+        .text1(language.text(Text::UpdateToastBody))
+        .on_activated(|_| {
+            crate::shell::open(crate::update::LATEST_RELEASE_URL);
+            Ok(())
+        })
+        .show()?;
+
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn send_toast_update_available(_title: &str, _language: Language) -> anyhow::Result<()> {
+    Ok(())
+}
+
+#[cfg(target_os = "windows")]
 fn toast_app_id() -> &'static str {
     use crate::APP_ID;
     use std::sync::OnceLock;

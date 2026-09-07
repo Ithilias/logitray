@@ -5,7 +5,9 @@ use crate::hid::scanner::scan_receivers;
 use crate::i18n::{Language, Text};
 use crate::icon;
 use crate::model::BatteryState;
-use crate::notify::Notifier;
+use crate::notify::{self, Notifier};
+use crate::shell;
+use crate::update::{self, CheckerCommand, Version};
 use crate::APP_ID;
 use anyhow::{Context, Result};
 use hidapi::HidApi;
@@ -23,6 +25,8 @@ enum UserEvent {
     Menu(String),
     /// An incremental device update or departure from a receiver worker.
     Device(DeviceEvent),
+    /// The background update check found a release newer than this build.
+    UpdateAvailable(Version),
 }
 
 /// Preset choices for the menu submenus. The numeric value is encoded into each
@@ -61,6 +65,8 @@ struct MenuHandles {
     view_mode_item: CheckMenuItem,
     notify_item: CheckMenuItem,
     autostart_item: CheckMenuItem,
+    check_updates_item: CheckMenuItem,
+    update_available_item: Option<MenuItem>,
     open_config_item: MenuItem,
     exit_item: MenuItem,
     device_items: Vec<CheckMenuItem>,
@@ -127,6 +133,13 @@ impl MenuHandles {
         let open_config_item =
             MenuItem::with_id("openconfig", language.text(Text::OpenConfig), true, None);
         let exit_item = MenuItem::with_id("exit", language.text(Text::Exit), true, None);
+        let check_updates_item = CheckMenuItem::with_id(
+            "checkupdates",
+            language.text(Text::CheckForUpdates),
+            true,
+            cfg.check_for_updates,
+            None,
+        );
 
         let languages = Submenu::new(language.text(Text::Language), true);
         let mut language_items = Vec::new();
@@ -159,6 +172,7 @@ impl MenuHandles {
             &threshold_submenu,
             &cooldown_submenu,
             &autostart_item,
+            &check_updates_item,
             &PredefinedMenuItem::separator(),
             &open_config_item,
             &PredefinedMenuItem::separator(),
@@ -174,6 +188,8 @@ impl MenuHandles {
             view_mode_item,
             notify_item,
             autostart_item,
+            check_updates_item,
+            update_available_item: None,
             open_config_item,
             exit_item,
             device_items: Vec::new(),
@@ -199,15 +215,11 @@ impl MenuHandles {
 
         for device in devices {
             let checked = device.device_key == selected_id;
-            let label = format!(
-                "{}: {}{}",
-                device.display_name,
+            let label = battery_label(
+                language,
+                &device.display_name,
                 device.battery_percent,
-                if device.is_charging {
-                    language.text(Text::Charging)
-                } else {
-                    "%"
-                }
+                device.is_charging,
             );
             let item = CheckMenuItem::with_id(
                 format!("device:{}", device.device_key),
@@ -220,6 +232,20 @@ impl MenuHandles {
             self.device_items.push(item);
         }
 
+        Ok(())
+    }
+
+    fn show_update(&mut self, version: Version) -> Result<()> {
+        let text = update_label(self.language, version);
+        match &self.update_available_item {
+            Some(item) => item.set_text(text),
+            None => {
+                let item = MenuItem::with_id("updateavailable", text, true, None);
+                // Directly under the status line.
+                self.root.insert(&item, 1)?;
+                self.update_available_item = Some(item);
+            }
+        }
         Ok(())
     }
 
@@ -271,6 +297,23 @@ fn set_preset(items: &[CheckMenuItem], prefix: &str, value: u64) {
     }
 }
 
+fn update_label(language: Language, version: Version) -> String {
+    format!("{}{version}", language.text(Text::UpdateAvailable))
+}
+
+/// The `G502 X PLUS: 46%` label shared by the tray tooltip, the status line and
+/// the device submenu, so the three cannot drift apart. Both unit strings come
+/// from the string table, so a future language can space or place the percent
+/// sign the way its typography wants.
+fn battery_label(language: Language, name: &str, percent: u8, charging: bool) -> String {
+    let unit = language.text(if charging {
+        Text::Charging
+    } else {
+        Text::Percent
+    });
+    format!("{name}: {percent}{unit}")
+}
+
 /// Re-sync the Language submenu's checkmarks to `language`. Needed when a
 /// switch fails, because muda has already toggled the clicked item by then.
 fn set_language_choice(items: &[CheckMenuItem], language: Language) {
@@ -308,8 +351,21 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     // receiver workers (and spawns workers for receivers as they appear).
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerCommand>();
     spawn_supervisor(proxy.clone(), cmd_rx, cfg.poll_interval_seconds);
+    let update_tx = update::spawn_checker(
+        cfg.check_for_updates,
+        Version::current(),
+        update::Schedule::default(),
+        update::fetch_latest_version,
+        {
+            let proxy = proxy.clone();
+            move |version| {
+                let _ = proxy.send_event(UserEvent::UpdateAvailable(version));
+            }
+        },
+    );
 
     let mut text_mode = cfg.text_mode();
+    let mut available_update: Option<Version> = None;
     let mut menu = MenuHandles::build(&cfg, autostart_enabled, text_mode)?;
     menu.touch_ids();
 
@@ -404,6 +460,9 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         )
                         .and_then(|mut replacement| {
                             replacement.rebuild_device_menu(&devices, &selected_id)?;
+                            if let Some(version) = available_update {
+                                replacement.show_update(version)?;
+                            }
                             Ok(replacement)
                         });
                         match rebuilt {
@@ -431,6 +490,15 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                                 set_language_choice(&menu.language_items, cfg.language);
                             }
                         }
+                    } else if id == "checkupdates" {
+                        // muda already toggled the check mark; read it directly.
+                        cfg.check_for_updates = menu.check_updates_item.is_checked();
+                        let _ = update_tx.send(CheckerCommand::SetEnabled(cfg.check_for_updates));
+                        if let Err(err) = config::save_config(&cfg) {
+                            tracing::warn!("failed saving config: {err}");
+                        }
+                    } else if id == "updateavailable" {
+                        shell::open(update::LATEST_RELEASE_URL);
                     } else if id == "openconfig" {
                         open_config_file();
                     } else if let Some(value) = id.strip_prefix("poll:") {
@@ -517,6 +585,29 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         tracing::warn!("failed refreshing tray: {err}");
                     }
                 }
+                UserEvent::UpdateAvailable(version) => {
+                    available_update = Some(version);
+                    if let Err(err) = menu.show_update(version) {
+                        tracing::warn!("failed adding update entry: {err}");
+                    }
+                    // The checker reports daily and on every start; toast once per release.
+                    let tag = version.to_string();
+                    if cfg.last_notified_update != tag {
+                        let toast = notify::send_toast_update_available(
+                            &update_label(menu.language, version),
+                            menu.language,
+                        );
+                        match toast {
+                            Ok(()) => {
+                                cfg.last_notified_update = tag;
+                                if let Err(err) = config::save_config(&cfg) {
+                                    tracing::warn!("failed saving config: {err}");
+                                }
+                            }
+                            Err(err) => tracing::warn!("failed showing update toast: {err}"),
+                        }
+                    }
+                }
             }
         }
     });
@@ -549,15 +640,11 @@ fn refresh_tray_visuals(
         };
         tray.set_icon(Some(icon))?;
 
-        let tooltip = format!(
-            "{}: {}{}",
-            device.display_name,
+        let tooltip = battery_label(
+            language,
+            &device.display_name,
             device.battery_percent,
-            if device.is_charging {
-                language.text(Text::Charging)
-            } else {
-                "%"
-            }
+            device.is_charging,
         );
         tray.set_tooltip(Some(tooltip.clone()))?;
         status_item.set_text(&tooltip);
@@ -671,22 +758,7 @@ fn spawn_supervisor(
 /// Open the config file in the user's default editor. The file always exists by
 /// the time the tray runs (created by `load_or_create_config`).
 fn open_config_file() {
-    let path = config::config_path();
-    #[cfg(target_os = "windows")]
-    {
-        // explorer hands the file to its associated editor and, unlike `cmd
-        // /C start`, does so without flashing a console window.
-        if let Err(err) = std::process::Command::new("explorer").arg(&path).spawn() {
-            tracing::warn!("failed opening config file {}: {err}", path.display());
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        tracing::warn!(
-            "opening the config file is only supported on Windows: {}",
-            path.display()
-        );
-    }
+    shell::open(config::config_path());
 }
 
 fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Result<()> {
@@ -702,7 +774,8 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::ensure_selected_device;
+    use super::{battery_label, ensure_selected_device};
+    use crate::i18n::Language;
     use crate::model::BatteryState;
 
     fn mk(id: &str) -> BatteryState {
@@ -730,5 +803,24 @@ mod tests {
         let mut selected = "b".to_string();
         assert!(!ensure_selected_device(&mut selected, &devices));
         assert_eq!(selected, "b");
+    }
+
+    #[test]
+    fn battery_label_composes_unit_from_the_string_table() {
+        let actual: Vec<_> = [Language::English, Language::SimplifiedChinese]
+            .into_iter()
+            .flat_map(|language| {
+                [false, true].map(|charging| battery_label(language, "G502 X PLUS", 46, charging))
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                "G502 X PLUS: 46%",
+                "G502 X PLUS: 46% (charging)",
+                "G502 X PLUS: 46%",
+                "G502 X PLUS: 46%（充电中）",
+            ]
+        );
     }
 }
