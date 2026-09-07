@@ -564,7 +564,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
 
                     devices = sorted_devices(&device_map);
 
-                    if ensure_selected_device(&mut selected_id, &devices) {
+                    if adopt_initial_device(&mut selected_id, &devices) {
                         cfg.selected_device_id = selected_id.clone();
                         if let Err(err) = config::save_config(&cfg) {
                             tracing::warn!("failed saving config: {err}");
@@ -649,24 +649,33 @@ fn refresh_tray_visuals(
         tray.set_tooltip(Some(tooltip.clone()))?;
         status_item.set_text(&tooltip);
     } else {
+        // Nothing at all, versus the chosen device being away while others are
+        // present. The second case is now reachable, because the choice is no
+        // longer silently re-pointed at whatever is still connected.
+        let message = if devices.is_empty() {
+            language.text(Text::NoDevicesFound)
+        } else {
+            language.text(Text::SelectedDeviceOffline)
+        };
         tray.set_icon(Some(icon::neutral_icon()?))?;
-        tray.set_tooltip(Some(language.text(Text::NoDevicesFound)))?;
-        status_item.set_text(language.text(Text::NoDevicesFound));
+        tray.set_tooltip(Some(message))?;
+        status_item.set_text(message);
     }
 
     Ok(())
 }
 
-fn ensure_selected_device(selected_id: &mut String, devices: &[BatteryState]) -> bool {
-    if devices.is_empty() {
-        if !selected_id.is_empty() {
-            selected_id.clear();
-            return true;
-        }
-        return false;
-    }
-
-    if devices.iter().any(|d| d.device_key == *selected_id) {
+/// Adopt a device on first run, when the user has not chosen one yet.
+///
+/// The choice is intent, not a cache: once set it is never reassigned or
+/// cleared just because the device is absent. A receiver unplugged for a
+/// moment, or a mouse switched off overnight, used to re-point the tray at
+/// another device (or wipe the setting) and persist that over the user's pick.
+///
+/// Returns `true` only when `selected_id` was newly adopted and so is worth
+/// persisting.
+fn adopt_initial_device(selected_id: &mut String, devices: &[BatteryState]) -> bool {
+    if !selected_id.is_empty() || devices.is_empty() {
         return false;
     }
 
@@ -774,7 +783,7 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{battery_label, ensure_selected_device};
+    use super::{adopt_initial_device, battery_label};
     use crate::i18n::Language;
     use crate::model::BatteryState;
 
@@ -790,10 +799,10 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_first_device() {
+    fn adopts_a_device_only_when_nothing_is_chosen_yet() {
         let devices = vec![mk("a"), mk("b")];
-        let mut selected = "missing".to_string();
-        assert!(ensure_selected_device(&mut selected, &devices));
+        let mut selected = String::new();
+        assert!(adopt_initial_device(&mut selected, &devices));
         assert_eq!(selected, "a");
     }
 
@@ -801,8 +810,34 @@ mod tests {
     fn no_change_when_selected_present() {
         let devices = vec![mk("a"), mk("b")];
         let mut selected = "b".to_string();
-        assert!(!ensure_selected_device(&mut selected, &devices));
+        assert!(!adopt_initial_device(&mut selected, &devices));
         assert_eq!(selected, "b");
+    }
+
+    /// The bug this replaced: an absent device used to be swapped for
+    /// `devices[0]` and the swap persisted, so unplugging a receiver for a
+    /// moment re-pointed the tray at something else for good.
+    #[test]
+    fn absent_selection_survives_other_devices_being_present() {
+        let devices = vec![mk("a"), mk("b")];
+        let mut selected = "missing".to_string();
+        assert!(!adopt_initial_device(&mut selected, &devices));
+        assert_eq!(selected, "missing");
+    }
+
+    /// The other half: everything going away used to clear the setting.
+    #[test]
+    fn selection_survives_all_devices_disappearing() {
+        let mut selected = "a".to_string();
+        assert!(!adopt_initial_device(&mut selected, &[]));
+        assert_eq!(selected, "a");
+    }
+
+    #[test]
+    fn nothing_to_adopt_when_there_are_no_devices() {
+        let mut selected = String::new();
+        assert!(!adopt_initial_device(&mut selected, &[]));
+        assert_eq!(selected, "");
     }
 
     #[test]

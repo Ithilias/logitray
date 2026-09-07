@@ -30,6 +30,7 @@ impl Language {
     pub fn text(self, key: Text) -> &'static str {
         let (english, chinese) = match key {
             Text::NoDevicesFound => ("No Logitech devices found", "未找到罗技设备"),
+            Text::SelectedDeviceOffline => ("Selected device not connected", "所选设备未连接"),
             Text::SelectDevice => ("Select Device", "选择设备"),
             Text::Refresh => ("Refresh now", "立即刷新"),
             Text::TextMode => ("Show percentage as text", "以文字显示百分比"),
@@ -77,6 +78,7 @@ impl Language {
 #[derive(Clone, Copy)]
 pub enum Text {
     NoDevicesFound,
+    SelectedDeviceOffline,
     SelectDevice,
     Refresh,
     TextMode,
