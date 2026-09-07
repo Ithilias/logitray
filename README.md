@@ -1,19 +1,19 @@
 # logitray
 
-A tiny Windows tray app that shows your wireless Logitech mouse's battery level and warns you before it dies — no Logitech G HUB or Options+ required.
+A tiny Windows tray app that shows the battery level of your wireless Logitech devices and warns you before they die. No Logitech G HUB or Options+ required.
 
 ## What it does
 
-logitray sits in your system tray and talks to your Logitech wireless mouse directly over the HID++ protocol through its USB receiver. It listens for the receiver's notifications, so battery, charging, and connect/disconnect changes show up on the tray icon within about a second (with a periodic re-read as a backstop), and it pops a Windows notification when the battery gets low — all without any Logitech software running.
+logitray sits in your system tray and talks to your Logitech wireless devices directly over the HID++ protocol through their USB receiver. It listens for the receiver's notifications, so battery, charging, and connect/disconnect changes show up on the tray icon within about a second (with a periodic re-read as a backstop), and it pops a Windows notification when a battery gets low. All of it works without any Logitech software running.
 
 ## Features
 
-- Live battery level for your wireless Logitech mouse, right in the system tray
+- Live battery level for any wireless Logitech device (mouse, keyboard, trackball), right in the system tray
 - Two view modes: a color-coded **battery glyph**, or the **percentage as text** — switch any time from the menu
 - Color coding: green (healthy), orange (low), red (critical), blue (charging)
 - Hover the icon for the device name and exact percentage
 - Automatic low-battery notifications, with a cooldown so they don't spam you
-- Multiple devices: pick which one the tray follows
+- Multiple devices: every paired device is monitored and alerted on; pick which one the tray icon follows
 - Manual "Refresh now" any time
 - Optional autostart with Windows
 - Optional daily check for new releases on GitHub (notify only)
@@ -61,7 +61,7 @@ CLI diagnostics and logs remain in English.
 
 ## Low-battery alerts
 
-When the selected device drops to or below the threshold (15% by default), logitray shows a Windows toast. To avoid nagging, it waits out a cooldown (120 minutes by default) before alerting again, and tracks each device separately.
+When **any** device drops to or below the threshold (15% by default), logitray shows a Windows toast. Alerts are not limited to the device the tray icon follows: every paired device is checked, whichever one the menu is pointed at. To avoid nagging, it waits out a cooldown (120 minutes by default) before alerting again, tracked separately for each device.
 
 ## Update check
 
@@ -71,9 +71,9 @@ Turn the check off with **Check for updates automatically** in the tray menu or 
 
 ## Supported devices
 
-Any Logitech wireless device that speaks **HID++ 2.0** through a Logitech **Unifying**, **LIGHTSPEED**, or **Bolt** USB receiver. Devices report their own marketing name over HID++, so there's no large hardcoded device database to maintain — the name you see is the one your mouse reports. Battery is read via feature `0x1000`, `0x1001` (voltage, converted with a lookup table), or `0x1004`, whichever the device supports.
+Any Logitech wireless device that speaks **HID++ 2.0** through a Logitech **Unifying**, **LIGHTSPEED**, or **Bolt** USB receiver: mice, keyboards, trackballs, and so on. Up to six paired devices per receiver are tracked. Devices report their own marketing name over HID++, so there's no large hardcoded device database to maintain. The name you see is the one your device reports. Battery is read via feature `0x1000`, `0x1001` (voltage, converted with a lookup table), or `0x1004`, whichever the device supports.
 
-Tested against a **G502 X PLUS** over a LIGHTSPEED receiver.
+Tested against a **G502 X PLUS** over a LIGHTSPEED receiver. Other device classes use the same generic HID++ battery features and are expected to work, but have not been verified against real hardware.
 
 ## Settings
 
