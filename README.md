@@ -86,7 +86,7 @@ Configuration lives in `%APPDATA%\logitray\config.toml` (created on first run):
 | `low_battery_cooldown_minutes` | `120` | Minimum time between repeat alerts per device |
 | `selected_device_id` | `""` | Which device the tray follows (set via the menu) |
 | `autostart` | `false` | Start logitray when you log in |
-| `log_level` | `"info"` | Log verbosity (`error`/`warn`/`info`/`debug`/`trace`) |
+| `log_level` | `"info"` | Log verbosity (`error`/`warn`/`info`/`debug`/`trace`). Applies to logitray's own output; dependencies are capped at `info` so `debug` doesn't fill the log with HTTP internals from the update check. |
 | `language` | `"auto"` | UI language: `auto` (Windows display language), `en`, or `zh-CN`. Unknown values fall back to English. |
 | `view_mode` | `"icon"` | Tray display: `icon` (battery glyph) or `text` (percentage) |
 | `check_for_updates` | `true` | Look for a newer release on GitHub at startup and once a day. Notify only; nothing is downloaded. |

@@ -52,8 +52,8 @@ pub fn run_tray() -> Result<()> {
 }
 
 fn init_logging(cfg: &config::AppConfig) {
-    let filter =
-        EnvFilter::try_new(cfg.log_level.clone()).unwrap_or_else(|_| EnvFilter::new("info"));
+    let filter = EnvFilter::try_new(log_directives(&cfg.log_level))
+        .unwrap_or_else(|_| EnvFilter::new("info"));
     let log_path = config::log_path();
 
     if let Some(parent) = log_path.parent() {
@@ -90,6 +90,28 @@ fn init_logging(cfg: &config::AppConfig) {
             log_path.display()
         );
     }
+}
+
+/// The levels `config.toml` documents for `log_level`.
+const LOG_LEVELS: [&str; 5] = ["error", "warn", "info", "debug", "trace"];
+
+/// Turns a configured `log_level` into `EnvFilter` directives that apply it to
+/// logitray only. Dependencies are capped at `info`, because `debug`/`trace`
+/// otherwise fills the log with the update check's HTTP internals (request,
+/// response headers and connection-pool churn on every check). Anything that
+/// isn't one of the documented levels is passed through untouched, so a
+/// hand-written directive string such as `logitray=debug,ureq=off` still works.
+fn log_directives(log_level: &str) -> String {
+    let level = log_level.trim().to_ascii_lowercase();
+    if !LOG_LEVELS.contains(&level.as_str()) {
+        return log_level.trim().to_string();
+    }
+    let dependencies = match level.as_str() {
+        "error" => "error",
+        "warn" => "warn",
+        _ => "info",
+    };
+    format!("{dependencies},logitray={level}")
 }
 
 #[derive(Clone, Debug)]
@@ -153,4 +175,56 @@ fn rotated_path(base: &Path, index: usize) -> Result<PathBuf> {
         .context("missing file name")?
         .to_string_lossy();
     Ok(parent.join(format!("{name}.{index}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::log_directives;
+    use tracing_subscriber::EnvFilter;
+
+    #[test]
+    fn documented_levels_apply_to_logitray_only() {
+        let actual: Vec<_> = [
+            "error", "warn", "info", "debug", "trace", "DEBUG", " debug ",
+        ]
+        .into_iter()
+        .map(log_directives)
+        .collect();
+        assert_eq!(
+            actual,
+            [
+                "error,logitray=error",
+                "warn,logitray=warn",
+                "info,logitray=info",
+                // debug/trace stay out of the dependencies, which is the point.
+                "info,logitray=debug",
+                "info,logitray=trace",
+                "info,logitray=debug",
+                "info,logitray=debug",
+            ]
+        );
+    }
+
+    #[test]
+    fn directive_strings_pass_through() {
+        let actual: Vec<_> = ["logitray=debug,ureq=off", "logitray::hid=trace", "nonsense"]
+            .into_iter()
+            .map(log_directives)
+            .collect();
+        assert_eq!(
+            actual,
+            ["logitray=debug,ureq=off", "logitray::hid=trace", "nonsense"]
+        );
+    }
+
+    #[test]
+    fn every_produced_directive_parses() {
+        for level in ["error", "warn", "info", "debug", "trace"] {
+            let directives = log_directives(level);
+            assert!(
+                EnvFilter::try_new(&directives).is_ok(),
+                "EnvFilter rejected {directives}"
+            );
+        }
+    }
 }
