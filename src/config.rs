@@ -8,6 +8,8 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AppConfig {
+    #[serde(default)]
+    pub language: crate::i18n::Language,
     pub poll_interval_seconds: u64,
     pub low_battery_threshold: u8,
     pub low_battery_cooldown_minutes: u64,
@@ -41,6 +43,7 @@ impl AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            language: crate::i18n::Language::Auto,
             // Battery and charging changes are pushed via HID++ notifications, so
             // this is only a backstop re-read for missed events / resume — a few
             // minutes is plenty and keeps idle USB traffic low.
@@ -213,6 +216,40 @@ pub fn save_device_profiles(profiles: &DeviceProfiles) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{AppConfig, DeviceProfile, DeviceProfiles};
+
+    #[test]
+    fn language_config_compatibility() {
+        use crate::i18n::Language;
+        let raw = toml::to_string(&AppConfig::default()).unwrap();
+        let legacy = raw
+            .lines()
+            .filter(|line| !line.starts_with("language ="))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let actual: Vec<_> = [None, Some("auto"), Some("en"), Some("zh-CN"), Some("fr")]
+            .into_iter()
+            .map(|value| {
+                let text = match value {
+                    Some(value) => format!("{legacy}\nlanguage = \"{value}\"\n"),
+                    None => legacy.clone(),
+                };
+                let cfg: AppConfig = toml::from_str(&text).unwrap();
+                let saved = toml::to_string(&cfg).unwrap();
+                let restored: AppConfig = toml::from_str(&saved).unwrap();
+                (cfg.language, restored.language)
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                (Language::Auto, Language::Auto),
+                (Language::Auto, Language::Auto),
+                (Language::English, Language::English),
+                (Language::SimplifiedChinese, Language::SimplifiedChinese),
+                (Language::English, Language::English),
+            ]
+        );
+    }
 
     #[test]
     fn device_profiles_roundtrip_and_upsert() {
