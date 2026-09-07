@@ -11,7 +11,7 @@ logitray sits in your system tray and talks to your Logitech wireless devices di
 - Live battery level for any wireless Logitech device (mouse, keyboard, trackball), right in the system tray
 - Two view modes: a color-coded **battery glyph**, or the **percentage as text** — switch any time from the menu
 - Color coding: green (healthy), orange (low), red (critical), blue (charging)
-- Hover the icon for the device name and exact percentage
+- Hover the icon for every device's name and exact percentage, one per line
 - Automatic low-battery notifications, with a cooldown so they don't spam you
 - Multiple devices: every paired device is monitored and alerted on; pick which one the tray icon follows
 - Manual "Refresh now" any time

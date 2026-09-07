@@ -305,6 +305,63 @@ fn update_label(language: Language, version: Version) -> String {
 /// the device submenu, so the three cannot drift apart. Both unit strings come
 /// from the string table, so a future language can space or place the percent
 /// sign the way its typography wants.
+/// How much of the Windows tooltip we are willing to fill, in UTF-16 units.
+///
+/// tray-icon copies up to 128 units into a `[u16; 128]` `szTip`, and at exactly
+/// 128 it fills every slot and leaves no NUL terminator, so we stay clear of
+/// the edge and do our own trimming rather than being chopped mid-name.
+const TOOLTIP_BUDGET: usize = 120;
+
+fn utf16_len(text: &str) -> usize {
+    text.encode_utf16().count()
+}
+
+/// `+N more`, for the devices that did not fit in the tooltip.
+fn more_marker(language: Language, dropped: usize) -> String {
+    language
+        .text(Text::MoreDevices)
+        .replace("{n}", &dropped.to_string())
+}
+
+/// One line per device for the tray tooltip, the followed device first so the
+/// thing the icon represents is always the line you read first.
+///
+/// Trimmed to [`TOOLTIP_BUDGET`] by dropping whole trailing lines and adding a
+/// `+N more` marker. The subject line is kept even if it alone overflows, since
+/// there is nothing more useful to show in its place.
+fn tooltip_text(language: Language, subject: &BatteryState, devices: &[BatteryState]) -> String {
+    let label = |device: &BatteryState| {
+        battery_label(
+            language,
+            &device.display_name,
+            device.battery_percent,
+            device.is_charging,
+        )
+    };
+
+    let mut lines = vec![label(subject)];
+    lines.extend(
+        devices
+            .iter()
+            .filter(|device| device.device_key != subject.device_key)
+            .map(label),
+    );
+
+    // Longest prefix of lines that still fits once its marker is accounted for.
+    for keep in (1..=lines.len()).rev() {
+        let mut candidate = lines[..keep].join("\n");
+        if keep < lines.len() {
+            candidate.push('\n');
+            candidate.push_str(&more_marker(language, lines.len() - keep));
+        }
+        if utf16_len(&candidate) <= TOOLTIP_BUDGET {
+            return candidate;
+        }
+    }
+
+    lines.swap_remove(0)
+}
+
 fn battery_label(language: Language, name: &str, percent: u8, charging: bool) -> String {
     let unit = language.text(if charging {
         Text::Charging
@@ -654,14 +711,17 @@ fn refresh_tray_visuals(
         };
         tray.set_icon(Some(icon))?;
 
-        let tooltip = battery_label(
+        // The tooltip covers every device; the status line stays a single one,
+        // because the Select Device submenu already lists them all and
+        // newlines do not belong in a Windows menu item.
+        let status = battery_label(
             language,
             &device.display_name,
             device.battery_percent,
             device.is_charging,
         );
-        tray.set_tooltip(Some(tooltip.clone()))?;
-        status_item.set_text(&tooltip);
+        tray.set_tooltip(Some(tooltip_text(language, device, devices)))?;
+        status_item.set_text(&status);
     } else {
         // Nothing at all, versus the chosen device being away while others are
         // present. The second case is now reachable, because the choice is no
@@ -797,7 +857,7 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{adopt_initial_device, battery_label};
+    use super::{adopt_initial_device, battery_label, tooltip_text, utf16_len, TOOLTIP_BUDGET};
     use crate::i18n::Language;
     use crate::model::BatteryState;
 
@@ -852,6 +912,56 @@ mod tests {
         let mut selected = String::new();
         assert!(!adopt_initial_device(&mut selected, &[]));
         assert_eq!(selected, "");
+    }
+
+    fn named(id: &str, name: &str, percent: u8) -> BatteryState {
+        BatteryState {
+            display_name: name.to_string(),
+            battery_percent: percent,
+            ..mk(id)
+        }
+    }
+
+    #[test]
+    fn tooltip_lists_the_subject_first_then_the_rest() {
+        let devices = vec![
+            named("a", "MX Keys", 80),
+            named("b", "G502 X PLUS", 42),
+            named("c", "MX Master 3S", 15),
+        ];
+        let tooltip = tooltip_text(Language::English, &devices[1], &devices);
+        assert_eq!(tooltip, "G502 X PLUS: 42%\nMX Keys: 80%\nMX Master 3S: 15%");
+    }
+
+    #[test]
+    fn tooltip_of_a_lone_device_has_no_trailing_newline() {
+        let devices = vec![named("a", "G502 X PLUS", 42)];
+        let tooltip = tooltip_text(Language::English, &devices[0], &devices);
+        assert_eq!(tooltip, "G502 X PLUS: 42%");
+    }
+
+    /// szTip is a fixed 128-unit buffer that tray-icon fills without a
+    /// terminator, so we must trim whole lines ourselves rather than let a
+    /// name be chopped in half.
+    #[test]
+    fn tooltip_drops_whole_lines_to_stay_inside_the_budget() {
+        let devices: Vec<_> = (0..6)
+            .map(|i| named(&format!("d{i}"), "Logitech Device With A Long Name", 50 + i))
+            .collect();
+        let tooltip = tooltip_text(Language::English, &devices[0], &devices);
+
+        assert!(
+            utf16_len(&tooltip) <= TOOLTIP_BUDGET,
+            "tooltip was {} units: {tooltip}",
+            utf16_len(&tooltip)
+        );
+        // Whole lines only: nothing but the marker may be a partial entry.
+        let lines: Vec<_> = tooltip.lines().collect();
+        let kept = lines.len() - 1;
+        assert_eq!(lines[kept], format!("+{} more", 6 - kept));
+        for line in &lines[..kept] {
+            assert!(line.ends_with('%'), "line was cut mid-entry: {line}");
+        }
     }
 
     #[test]

@@ -31,6 +31,8 @@ impl Language {
         let (english, chinese) = match key {
             Text::NoDevicesFound => ("No Logitech devices found", "未找到罗技设备"),
             Text::SelectedDeviceOffline => ("Selected device not connected", "所选设备未连接"),
+            // "{n}" is replaced with the number of devices that did not fit.
+            Text::MoreDevices => ("+{n} more", "还有 {n} 个设备"),
             Text::SelectDevice => ("Select Device", "选择设备"),
             Text::Refresh => ("Refresh now", "立即刷新"),
             Text::TextMode => ("Show percentage as text", "以文字显示百分比"),
@@ -79,6 +81,7 @@ impl Language {
 pub enum Text {
     NoDevicesFound,
     SelectedDeviceOffline,
+    MoreDevices,
     SelectDevice,
     Refresh,
     TextMode,
