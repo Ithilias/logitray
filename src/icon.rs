@@ -6,31 +6,49 @@ const SIZE: usize = 16;
 const TEXT_SIZE: usize = 32;
 
 pub fn neutral_icon() -> Result<Icon> {
-    build_icon(None, false)
+    // No level means no fill and no color ramp, so the threshold is unused.
+    build_icon(None, false, 0)
 }
 
-pub fn battery_icon(percent: u8, charging: bool) -> Result<Icon> {
-    build_icon(Some(percent), charging)
+pub fn battery_icon(percent: u8, charging: bool, threshold: u8) -> Result<Icon> {
+    build_icon(Some(percent), charging, threshold)
 }
 
 /// Render the battery percentage as text (the digits themselves are the icon).
 /// Used by the "show percentage as text" view mode. Digits are colored by
 /// level and given a dark outline so they read on light or dark taskbars.
-pub fn text_icon(percent: u8, charging: bool) -> Result<Icon> {
+pub fn text_icon(percent: u8, charging: bool, threshold: u8) -> Result<Icon> {
     let mut pixels = vec![0u8; TEXT_SIZE * TEXT_SIZE * 4];
     let label = percent.min(100).to_string();
-    draw_number(&mut pixels, &label, level_color(percent, charging));
+    draw_number(
+        &mut pixels,
+        &label,
+        level_color(percent, charging, threshold),
+    );
     Icon::from_rgba(pixels, TEXT_SIZE as u32, TEXT_SIZE as u32)
         .context("failed building text tray icon")
 }
 
+/// Top of the orange band. Kept at least 20 points above the red band so a high
+/// threshold does not leave the icon jumping straight from red to green, and at
+/// least at 35 so the default threshold of 15 reproduces the original ramp.
+fn orange_ceiling(threshold: u8) -> u8 {
+    threshold.saturating_add(20).max(35)
+}
+
 /// Shared color ramp for both the battery fill and the text digits.
-fn level_color(percent: u8, charging: bool) -> [u8; 4] {
+///
+/// Red is whatever the user configured as `low_battery_threshold`, so the icon
+/// turns red exactly when a low-battery toast would fire. Previously red was
+/// hard-coded at 15 while the threshold was settable from 5 to 30, so at a
+/// threshold of 30 a device could alert while still rendering orange, and at 5
+/// it could render red without ever alerting.
+fn level_color(percent: u8, charging: bool, threshold: u8) -> [u8; 4] {
     if charging {
         [90, 170, 255, 255]
-    } else if percent <= 15 {
+    } else if percent <= threshold {
         [230, 70, 70, 255]
-    } else if percent <= 35 {
+    } else if percent <= orange_ceiling(threshold) {
         [240, 170, 70, 255]
     } else {
         [90, 220, 120, 255]
@@ -140,13 +158,13 @@ fn put_sized(pixels: &mut [u8], size: usize, x: usize, y: usize, rgba: [u8; 4]) 
     pixels[idx..idx + 4].copy_from_slice(&rgba);
 }
 
-fn build_icon(percent: Option<u8>, charging: bool) -> Result<Icon> {
+fn build_icon(percent: Option<u8>, charging: bool, threshold: u8) -> Result<Icon> {
     let mut pixels = vec![0u8; SIZE * SIZE * 4];
 
     draw_battery_shell(&mut pixels);
 
     match percent {
-        Some(level) => draw_battery_fill(&mut pixels, level, charging),
+        Some(level) => draw_battery_fill(&mut pixels, level, charging, threshold),
         None => draw_unknown_mark(&mut pixels),
     }
 
@@ -173,8 +191,8 @@ fn draw_battery_shell(pixels: &mut [u8]) {
     put(pixels, 15, 8, border);
 }
 
-fn draw_battery_fill(pixels: &mut [u8], percent: u8, charging: bool) {
-    let color = level_color(percent, charging);
+fn draw_battery_fill(pixels: &mut [u8], percent: u8, charging: bool, threshold: u8) {
+    let color = level_color(percent, charging, threshold);
 
     let clamped = percent.min(100) as usize;
     let width = (clamped * 10).div_ceil(100);
@@ -200,22 +218,75 @@ fn put(pixels: &mut [u8], x: usize, y: usize, rgba: [u8; 4]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{battery_icon, neutral_icon, text_icon};
+    use super::{battery_icon, level_color, neutral_icon, text_icon};
+
+    const BLUE: [u8; 4] = [90, 170, 255, 255];
+    const RED: [u8; 4] = [230, 70, 70, 255];
+    const ORANGE: [u8; 4] = [240, 170, 70, 255];
+    const GREEN: [u8; 4] = [90, 220, 120, 255];
 
     #[test]
     fn icon_generation_works() {
         assert!(neutral_icon().is_ok());
-        assert!(battery_icon(5, false).is_ok());
-        assert!(battery_icon(50, false).is_ok());
-        assert!(battery_icon(100, true).is_ok());
+        assert!(battery_icon(5, false, 15).is_ok());
+        assert!(battery_icon(50, false, 15).is_ok());
+        assert!(battery_icon(100, true, 15).is_ok());
     }
 
     #[test]
     fn text_icon_generation_works() {
         // 1, 2, and 3 digit values must all rasterize without panicking.
-        assert!(text_icon(7, false).is_ok());
-        assert!(text_icon(76, false).is_ok());
-        assert!(text_icon(100, true).is_ok());
-        assert!(text_icon(0, false).is_ok());
+        assert!(text_icon(7, false, 15).is_ok());
+        assert!(text_icon(76, false, 15).is_ok());
+        assert!(text_icon(100, true, 15).is_ok());
+        assert!(text_icon(0, false, 15).is_ok());
+    }
+
+    /// The default threshold must reproduce the original hard-coded ramp
+    /// exactly, so existing users see no change in appearance.
+    #[test]
+    fn default_threshold_reproduces_the_original_ramp() {
+        let actual: Vec<_> = [0, 15, 16, 35, 36, 100]
+            .into_iter()
+            .map(|percent| level_color(percent, false, 15))
+            .collect();
+        assert_eq!(actual, [RED, RED, ORANGE, ORANGE, GREEN, GREEN]);
+    }
+
+    #[test]
+    fn red_band_follows_the_configured_threshold() {
+        // At a threshold of 30, 25% alerts, so it must not still look healthy;
+        // at 5, 12% never alerts, so it must not look critical.
+        let actual: Vec<_> = [
+            (25, 30),
+            (30, 30),
+            (31, 30),
+            (50, 30),
+            (51, 30),
+            (5, 5),
+            (6, 5),
+            (12, 5),
+            (35, 5),
+            (36, 5),
+        ]
+        .into_iter()
+        .map(|(percent, threshold)| level_color(percent, false, threshold))
+        .collect();
+        assert_eq!(
+            actual,
+            [
+                RED, RED, ORANGE, ORANGE, GREEN, // threshold 30
+                RED, ORANGE, ORANGE, ORANGE, GREEN, // threshold 5
+            ]
+        );
+    }
+
+    #[test]
+    fn charging_wins_over_every_band() {
+        let actual: Vec<_> = [(0, 15), (5, 30), (100, 5)]
+            .into_iter()
+            .map(|(percent, threshold)| level_color(percent, true, threshold))
+            .collect();
+        assert_eq!(actual, [BLUE, BLUE, BLUE]);
     }
 }
