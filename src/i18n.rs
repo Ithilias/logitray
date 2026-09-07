@@ -44,6 +44,10 @@ impl Language {
             Text::Charging => ("% (charging)", "%（充电中）"),
             Text::Language => ("Language", "语言"),
             Text::Automatic => ("Automatic (Windows language)", "自动（Windows 语言）"),
+            Text::CheckForUpdates => ("Check for updates automatically", "自动检查更新"),
+            // Prefix for "{prefix}{version}", hence the trailing separator.
+            Text::UpdateAvailable => ("Update available: ", "有可用更新："),
+            Text::UpdateToastBody => ("Click to open the download page", "点击前往下载页面"),
             Text::LowBattery => (
                 "Battery low, plug in charger soon",
                 "电量低，请及时连接充电器",
@@ -86,6 +90,9 @@ pub enum Text {
     Charging,
     Language,
     Automatic,
+    CheckForUpdates,
+    UpdateAvailable,
+    UpdateToastBody,
     LowBattery,
     Seconds15,
     Seconds30,

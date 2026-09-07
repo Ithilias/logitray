@@ -16,6 +16,7 @@ logitray sits in your system tray and talks to your Logitech wireless mouse dire
 - Multiple devices: pick which one the tray follows
 - Manual "Refresh now" any time
 - Optional autostart with Windows
+- Optional daily check for new releases on GitHub (notify only)
 - Event-driven: connect, disconnect, charging, and battery-level changes are pushed by the receiver and reflected within ~1s — no busy polling, near-zero idle USB traffic, with a periodic re-read as a backstop
 
 ## Install & run
@@ -40,6 +41,7 @@ Right-click the icon for the menu:
 - **Low battery alert at** — the percentage (5% to 30%) at or below which the toast fires
 - **Reminder interval** — minimum time between repeat alerts per device (30 minutes to 8 hours)
 - **Start at login** — register/unregister autostart with Windows
+- **Check for updates automatically** — toggle the startup and daily check for new releases on GitHub (see Update check below)
 - **Open config file…** — open `config.toml` in the default editor
 - **Exit**
 
@@ -61,6 +63,12 @@ CLI diagnostics and logs remain in English.
 
 When the selected device drops to or below the threshold (15% by default), logitray shows a Windows toast. To avoid nagging, it waits out a cooldown (120 minutes by default) before alerting again, and tracks each device separately.
 
+## Update check
+
+By default, logitray checks about a minute after startup and then once a day whether a newer release exists. The check is a single request to the GitHub releases page that reads the latest tag from the redirect. GitHub receives your IP address and the app version (user agent `logitray/<version>`); no identifiers or device data are sent. A failed check, for example because the network is not up yet, is retried after ten minutes. When a newer release exists, a toast appears once per new version and an **Update available** entry is added to the tray menu; clicking either opens the release page in your browser. Nothing is downloaded or installed automatically.
+
+Turn the check off with **Check for updates automatically** in the tray menu or `check_for_updates = false` in the config. Turning it back on checks right away.
+
 ## Supported devices
 
 Any Logitech wireless device that speaks **HID++ 2.0** through a Logitech **Unifying**, **LIGHTSPEED**, or **Bolt** USB receiver. Devices report their own marketing name over HID++, so there's no large hardcoded device database to maintain — the name you see is the one your mouse reports. Battery is read via feature `0x1000`, `0x1001` (voltage, converted with a lookup table), or `0x1004`, whichever the device supports.
@@ -81,6 +89,8 @@ Configuration lives in `%APPDATA%\logitray\config.toml` (created on first run):
 | `log_level` | `"info"` | Log verbosity (`error`/`warn`/`info`/`debug`/`trace`) |
 | `language` | `"auto"` | UI language: `auto` (Windows display language), `en`, or `zh-CN`. Unknown values fall back to English. |
 | `view_mode` | `"icon"` | Tray display: `icon` (battery glyph) or `text` (percentage) |
+| `check_for_updates` | `true` | Look for a newer release on GitHub at startup and once a day. Notify only; nothing is downloaded. |
+| `last_notified_update` | `""` | Release the update toast was last shown for (set automatically) |
 
 Enumerated device details (which battery feature to use, the device name) are cached per device in `%APPDATA%\logitray\devices.toml` so cold starts can skip the slower HID++ feature enumeration. It's safe to delete — it rebuilds itself.
 

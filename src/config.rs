@@ -22,6 +22,12 @@ pub struct AppConfig {
     /// Whether low-battery toast notifications are shown at all.
     #[serde(default = "default_notifications_enabled")]
     pub notifications_enabled: bool,
+    /// Whether to look for a newer release on GitHub at startup and once a day.
+    #[serde(default = "default_check_for_updates")]
+    pub check_for_updates: bool,
+    /// Release the update toast was last shown for, so restarts do not repeat it.
+    #[serde(default)]
+    pub last_notified_update: String,
 }
 
 fn default_view_mode() -> String {
@@ -29,6 +35,10 @@ fn default_view_mode() -> String {
 }
 
 fn default_notifications_enabled() -> bool {
+    true
+}
+
+fn default_check_for_updates() -> bool {
     true
 }
 
@@ -55,6 +65,8 @@ impl Default for AppConfig {
             log_level: "info".to_string(),
             view_mode: default_view_mode(),
             notifications_enabled: default_notifications_enabled(),
+            check_for_updates: default_check_for_updates(),
+            last_notified_update: String::new(),
         }
     }
 }
@@ -217,25 +229,34 @@ pub fn save_device_profiles(profiles: &DeviceProfiles) -> Result<()> {
 mod tests {
     use super::{AppConfig, DeviceProfile, DeviceProfiles};
 
+    /// Serializes the default config without `key`, appends `line` if given,
+    /// then loads, saves and reloads it, returning both parsed configs.
+    fn reload_with(key: &str, line: Option<String>) -> (AppConfig, AppConfig) {
+        let raw = toml::to_string(&AppConfig::default()).unwrap();
+        let mut text = raw
+            .lines()
+            .filter(|l| !l.starts_with(&format!("{key} =")))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if let Some(line) = line {
+            text.push('\n');
+            text.push_str(&line);
+            text.push('\n');
+        }
+        let cfg: AppConfig = toml::from_str(&text).unwrap();
+        let saved = toml::to_string(&cfg).unwrap();
+        let restored: AppConfig = toml::from_str(&saved).unwrap();
+        (cfg, restored)
+    }
+
     #[test]
     fn language_config_compatibility() {
         use crate::i18n::Language;
-        let raw = toml::to_string(&AppConfig::default()).unwrap();
-        let legacy = raw
-            .lines()
-            .filter(|line| !line.starts_with("language ="))
-            .collect::<Vec<_>>()
-            .join("\n");
         let actual: Vec<_> = [None, Some("auto"), Some("en"), Some("zh-CN"), Some("fr")]
             .into_iter()
             .map(|value| {
-                let text = match value {
-                    Some(value) => format!("{legacy}\nlanguage = \"{value}\"\n"),
-                    None => legacy.clone(),
-                };
-                let cfg: AppConfig = toml::from_str(&text).unwrap();
-                let saved = toml::to_string(&cfg).unwrap();
-                let restored: AppConfig = toml::from_str(&saved).unwrap();
+                let line = value.map(|value| format!("language = \"{value}\""));
+                let (cfg, restored) = reload_with("language", line);
                 (cfg.language, restored.language)
             })
             .collect();
@@ -247,6 +268,38 @@ mod tests {
                 (Language::English, Language::English),
                 (Language::SimplifiedChinese, Language::SimplifiedChinese),
                 (Language::English, Language::English),
+            ]
+        );
+    }
+
+    #[test]
+    fn check_for_updates_defaults_on_and_roundtrips() {
+        let actual: Vec<_> = [None, Some(true), Some(false)]
+            .into_iter()
+            .map(|value| {
+                let line = value.map(|value| format!("check_for_updates = {value}"));
+                let (cfg, restored) = reload_with("check_for_updates", line);
+                (cfg.check_for_updates, restored.check_for_updates)
+            })
+            .collect();
+        assert_eq!(actual, [(true, true), (true, true), (false, false)]);
+    }
+
+    #[test]
+    fn last_notified_update_defaults_empty_and_roundtrips() {
+        let actual: Vec<_> = [None, Some("v0.4.0")]
+            .into_iter()
+            .map(|value| {
+                let line = value.map(|value| format!("last_notified_update = \"{value}\""));
+                let (cfg, restored) = reload_with("last_notified_update", line);
+                (cfg.last_notified_update, restored.last_notified_update)
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                (String::new(), String::new()),
+                ("v0.4.0".to_string(), "v0.4.0".to_string()),
             ]
         );
     }
