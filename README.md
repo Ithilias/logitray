@@ -35,7 +35,7 @@ Right-click the icon for the menu:
 - **Select Device** — choose which device the tray follows when more than one is paired
 - **Refresh now** — re-check all devices immediately instead of waiting for the backstop re-read
 - **Show percentage as text** — toggle between the battery-glyph icon and the percentage-number icon
-- **Language** — Automatic (Windows display language), English, or 简体中文
+- **Language** — Automatic (Windows language), English, or 简体中文
 - **Poll interval** — how often to re-read all devices as a backstop (15 seconds to 15 minutes; battery changes are pushed, so this only bounds the fallback)
 - **Enable low-battery notifications** — toggle the Windows toast
 - **Low battery alert at** — the percentage (5% to 30%) at or below which the toast fires
