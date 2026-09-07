@@ -35,7 +35,12 @@ Right-click the icon for the menu:
 - **Refresh now** — re-check all devices immediately instead of waiting for the backstop re-read
 - **Show percentage as text** — toggle between the battery-glyph icon and the percentage-number icon
 - **Language** — Automatic (Windows display language), English, or 简体中文
+- **Poll interval** — how often to re-read all devices as a backstop (15 seconds to 15 minutes; battery changes are pushed, so this only bounds the fallback)
+- **Enable low-battery notifications** — toggle the Windows toast
+- **Low battery alert at** — the percentage (5% to 30%) at or below which the toast fires
+- **Reminder interval** — minimum time between repeat alerts per device (30 minutes to 8 hours)
 - **Start at login** — register/unregister autostart with Windows
+- **Open config file…** — open `config.toml` in the default editor
 - **Exit**
 
 Icon colors: **green** ≥ 36%, **orange** 16–35%, **red** ≤ 15%, **blue** while charging.
