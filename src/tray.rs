@@ -387,6 +387,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
         &menu.status_item,
         text_mode,
         menu.language,
+        cfg.low_battery_threshold,
     ) {
         tracing::warn!("failed initializing tray: {err}");
     }
@@ -437,6 +438,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                             &menu.status_item,
                             text_mode,
                             menu.language,
+                            cfg.low_battery_threshold,
                         ) {
                             tracing::warn!("failed updating tray: {err}");
                         }
@@ -478,6 +480,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                                     &menu.status_item,
                                     text_mode,
                                     menu.language,
+                                    cfg.low_battery_threshold,
                                 ) {
                                     tracing::warn!("failed updating translated tray: {err}");
                                 }
@@ -545,6 +548,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                             &menu.status_item,
                             text_mode,
                             menu.language,
+                            cfg.low_battery_threshold,
                         ) {
                             tracing::warn!("failed updating tray: {err}");
                         }
@@ -581,6 +585,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         &menu.status_item,
                         text_mode,
                         menu.language,
+                        cfg.low_battery_threshold,
                     ) {
                         tracing::warn!("failed refreshing tray: {err}");
                     }
@@ -629,14 +634,23 @@ fn refresh_tray_visuals(
     status_item: &MenuItem,
     text_mode: bool,
     language: Language,
+    low_battery_threshold: u8,
 ) -> Result<()> {
     let selected = devices.iter().find(|d| d.device_key == selected_id);
 
     if let Some(device) = selected {
         let icon = if text_mode {
-            icon::text_icon(device.battery_percent, device.is_charging)?
+            icon::text_icon(
+                device.battery_percent,
+                device.is_charging,
+                low_battery_threshold,
+            )?
         } else {
-            icon::battery_icon(device.battery_percent, device.is_charging)?
+            icon::battery_icon(
+                device.battery_percent,
+                device.is_charging,
+                low_battery_threshold,
+            )?
         };
         tray.set_icon(Some(icon))?;
 
