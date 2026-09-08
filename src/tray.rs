@@ -597,6 +597,21 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                                 tracing::warn!("failed saving config: {err}");
                             }
                             set_preset(&menu.threshold_items, "threshold", u64::from(threshold));
+                            // The icon's color bands are derived from the
+                            // threshold, so the change has to be repainted now
+                            // rather than at the next device event, which with
+                            // no battery activity is a whole safety re-read away.
+                            if let Err(err) = refresh_tray_visuals(
+                                &mut tray,
+                                &devices,
+                                subject.pick(&devices, &selected_id),
+                                &menu.status_item,
+                                text_mode,
+                                menu.language,
+                                cfg.low_battery_threshold,
+                            ) {
+                                tracing::warn!("failed updating tray: {err}");
+                            }
                         }
                     } else if let Some(value) = id.strip_prefix("cooldown:") {
                         if let Ok(minutes) = value.parse::<u64>() {
