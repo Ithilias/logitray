@@ -53,6 +53,14 @@ impl Notifier {
     }
 
     pub fn maybe_notify_low_battery(&mut self, state: &BatteryState) -> bool {
+        // Charging, or back above the threshold, ends this device's low-battery
+        // episode. Drop its cooldown stamp so the next dip is treated as a new
+        // episode rather than being silenced by the alert for the previous one.
+        if state.is_charging || state.battery_percent > self.threshold {
+            self.last_sent.remove(&state.device_key);
+            return false;
+        }
+
         let now = Instant::now();
         if !self.should_notify(state, now) {
             return false;
@@ -186,6 +194,27 @@ mod tests {
     fn disabled_suppresses_notifications() {
         let notifier = Notifier::new(Language::English, false, 15, 120);
         assert!(!notifier.should_notify(&make_state(10, false), Instant::now()));
+    }
+
+    /// The cooldown exists to stop nagging inside one low-battery episode, not
+    /// to span a recharge. A device that charges back up and drains again has
+    /// started a new episode and must be allowed to warn.
+    #[test]
+    fn recharging_re_arms_the_warning() {
+        let mut notifier = Notifier::new(Language::English, true, 15, 120);
+        let now = Instant::now();
+        let low = make_state(12, false);
+
+        // Stand in for an alert that has just fired.
+        notifier.last_sent.insert(low.device_key.clone(), now);
+        assert!(!notifier.should_notify(&low, now));
+
+        // Plugged in, then back above the threshold: the episode is over.
+        assert!(!notifier.maybe_notify_low_battery(&make_state(30, true)));
+        assert!(!notifier.maybe_notify_low_battery(&make_state(80, false)));
+
+        // The next dip is a new episode, well inside the 120 minute cooldown.
+        assert!(notifier.should_notify(&low, now + Duration::from_secs(60)));
     }
 
     #[test]
