@@ -507,7 +507,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         if let Err(err) = refresh_tray_visuals(
                             &mut tray,
                             &devices,
-                            subject.pick(&devices, &selected_id),
+                            subject.pick(&devices, &selected_id, cfg.low_battery_threshold),
                             &menu.status_item,
                             text_mode,
                             menu.language,
@@ -549,7 +549,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                                 if let Err(err) = refresh_tray_visuals(
                                     &mut tray,
                                     &devices,
-                                    subject.pick(&devices, &selected_id),
+                                    subject.pick(&devices, &selected_id, cfg.low_battery_threshold),
                                     &menu.status_item,
                                     text_mode,
                                     menu.language,
@@ -604,7 +604,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                             if let Err(err) = refresh_tray_visuals(
                                 &mut tray,
                                 &devices,
-                                subject.pick(&devices, &selected_id),
+                                subject.pick(&devices, &selected_id, cfg.low_battery_threshold),
                                 &menu.status_item,
                                 text_mode,
                                 menu.language,
@@ -632,7 +632,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         if let Err(err) = refresh_tray_visuals(
                             &mut tray,
                             &devices,
-                            subject.pick(&devices, &selected_id),
+                            subject.pick(&devices, &selected_id, cfg.low_battery_threshold),
                             &menu.status_item,
                             text_mode,
                             menu.language,
@@ -672,7 +672,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                     if let Err(err) = refresh_tray_visuals(
                         &mut tray,
                         &devices,
-                        subject.pick(&devices, &selected_id),
+                        subject.pick(&devices, &selected_id, cfg.low_battery_threshold),
                         &menu.status_item,
                         text_mode,
                         menu.language,
@@ -789,10 +789,16 @@ const AUTO_SWITCH_MARGIN: u8 = 5;
 /// candidate is lower by at least [`AUTO_SWITCH_MARGIN`], so an exact tie leaves
 /// the icon alone. A subject that starts charging or disappears leaves the pool
 /// and is replaced at once.
+///
+/// The margin does not apply across `low_battery_threshold`: a candidate that
+/// has crossed it while the subject has not takes the icon immediately, so the
+/// icon cannot sit on a healthy device while a different one is low enough to
+/// be firing toasts.
 fn pick_subject<'a>(
     devices: &'a [BatteryState],
     selected_id: &str,
     current: Option<&str>,
+    low_battery_threshold: u8,
 ) -> Option<&'a BatteryState> {
     if selected_id != config::AUTO_SUBJECT_ID {
         return devices
@@ -816,15 +822,24 @@ fn pick_subject<'a>(
     // min_by_key keeps the first minimum and the caller passes `sorted_devices`
     // output, so equal levels resolve to the same device on every pass.
     let lowest = *pool.iter().min_by_key(|device| device.battery_percent)?;
-    let incumbent = current.and_then(|key| pool.iter().find(|d| d.device_key == key).copied());
+    let Some(held) = current.and_then(|key| pool.iter().find(|d| d.device_key == key).copied())
+    else {
+        return Some(lowest);
+    };
 
-    match incumbent {
+    // Hysteresis exists to stop the icon flapping between two similar readings.
+    // It must not outrank the alert: once a candidate is at or below the
+    // threshold and the incumbent is not, the icon belongs to the candidate,
+    // whatever the gap between them.
+    let crossed_alert = lowest.battery_percent <= low_battery_threshold
+        && held.battery_percent > low_battery_threshold;
+    let clearly_lower =
+        held.battery_percent.saturating_sub(lowest.battery_percent) >= AUTO_SWITCH_MARGIN;
+
+    if crossed_alert || clearly_lower {
+        Some(lowest)
+    } else {
         Some(held)
-            if held.battery_percent.saturating_sub(lowest.battery_percent) < AUTO_SWITCH_MARGIN =>
-        {
-            Some(held)
-        }
-        _ => Some(lowest),
     }
 }
 
@@ -841,8 +856,14 @@ impl SubjectTracker {
         &mut self,
         devices: &'a [BatteryState],
         selected_id: &str,
+        low_battery_threshold: u8,
     ) -> Option<&'a BatteryState> {
-        let picked = pick_subject(devices, selected_id, self.0.as_deref());
+        let picked = pick_subject(
+            devices,
+            selected_id,
+            self.0.as_deref(),
+            low_battery_threshold,
+        );
         self.0 = picked.map(|device| device.device_key.clone());
         picked
     }
@@ -1083,12 +1104,16 @@ mod tests {
         }
     }
 
+    /// 15 is the default `low_battery_threshold`, so these read the way the
+    /// shipped configuration behaves.
+    const THRESHOLD: u8 = 15;
+
     fn subject_key(
         devices: &[BatteryState],
         selected: &str,
         current: Option<&str>,
     ) -> Option<String> {
-        pick_subject(devices, selected, current).map(|device| device.device_key.clone())
+        pick_subject(devices, selected, current, THRESHOLD).map(|device| device.device_key.clone())
     }
 
     #[test]
@@ -1176,6 +1201,46 @@ mod tests {
         );
     }
 
+    /// The margin must not outrank the alert. The toast fires for any device at
+    /// or below the threshold, so the icon has to be showing that device rather
+    /// than a healthier one that happens to be within five points.
+    #[test]
+    fn auto_hands_over_at_once_when_a_candidate_crosses_the_threshold() {
+        // 18 against 14 is inside the margin, but 14 is below the threshold and
+        // 18 is not, so the icon follows the device that is actually alerting.
+        let crossed = vec![at("a", 18), at("b", 14)];
+        assert_eq!(
+            subject_key(&crossed, AUTO_SUBJECT_ID, Some("a")).as_deref(),
+            Some("b")
+        );
+
+        // Both below the threshold: no crossing, so the margin applies again and
+        // the incumbent keeps the icon.
+        let both_low = vec![at("a", 14), at("b", 12)];
+        assert_eq!(
+            subject_key(&both_low, AUTO_SUBJECT_ID, Some("a")).as_deref(),
+            Some("a")
+        );
+
+        // Both above it: unchanged, the margin still holds the icon still.
+        let both_fine = vec![at("a", 40), at("b", 37)];
+        assert_eq!(
+            subject_key(&both_fine, AUTO_SUBJECT_ID, Some("a")).as_deref(),
+            Some("a")
+        );
+    }
+
+    /// A charging device is not a candidate, so it cannot trigger the crossing
+    /// either: the icon does not chase something that is already recovering.
+    #[test]
+    fn a_charging_device_below_the_threshold_does_not_take_the_icon() {
+        let devices = vec![at("a", 18), charging_at("b", 5)];
+        assert_eq!(
+            subject_key(&devices, AUTO_SUBJECT_ID, Some("a")).as_deref(),
+            Some("a")
+        );
+    }
+
     #[test]
     fn the_tracker_carries_the_subject_across_passes() {
         let mut subject = SubjectTracker::default();
@@ -1183,18 +1248,18 @@ mod tests {
 
         let first = vec![at("a", 40), at("b", 80)];
         assert_eq!(
-            key(subject.pick(&first, AUTO_SUBJECT_ID)).as_deref(),
+            key(subject.pick(&first, AUTO_SUBJECT_ID, THRESHOLD)).as_deref(),
             Some("a")
         );
         // b drops below a without clearing the margin, so the icon holds still.
         let second = vec![at("a", 40), at("b", 38)];
         assert_eq!(
-            key(subject.pick(&second, AUTO_SUBJECT_ID)).as_deref(),
+            key(subject.pick(&second, AUTO_SUBJECT_ID, THRESHOLD)).as_deref(),
             Some("a")
         );
         let third = vec![at("a", 40), at("b", 34)];
         assert_eq!(
-            key(subject.pick(&third, AUTO_SUBJECT_ID)).as_deref(),
+            key(subject.pick(&third, AUTO_SUBJECT_ID, THRESHOLD)).as_deref(),
             Some("b")
         );
     }

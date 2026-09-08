@@ -51,7 +51,7 @@ Icon colors follow the low-battery threshold, so the icon turns red exactly when
 
 By default the tray follows **Automatic (lowest battery)**: the icon and status line show whichever connected device is closest to running out, so one glance answers "is anything about to die?". With a single device this is exactly the same as following that device. To pin the icon to one device instead, choose it from **Select Device**.
 
-Automatic passes over devices that are charging, so a mouse resting on its cable does not take the icon from a keyboard that is actually running low. If every device is charging, the lowest of them is shown. It also only hands the icon over once another device is at least 5 points lower, so two devices sitting at similar levels do not make it flip back and forth.
+Automatic passes over devices that are charging, so a mouse resting on its cable does not take the icon from a keyboard that is actually running low. If every device is charging, the lowest of them is shown. It also only hands the icon over once another device is at least 5 points lower, so two devices sitting at similar levels do not make it flip back and forth. That margin does not apply across the low-battery threshold: a device that drops to it takes the icon straight away, so the icon is never showing a healthy device while a different one is low enough to be alerting.
 
 The tooltip lists the other devices either way, trimming the tail to a `+N more` marker when they do not all fit. In `text` view mode the icon is a bare number with no name attached, so under Automatic the tooltip or the status line is what tells you which device it belongs to.
 
