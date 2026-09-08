@@ -41,8 +41,16 @@ pub fn run_once() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 pub fn run_tray() -> Result<()> {
-    let cfg = config::load_or_create_config()?;
+    // The tray is a GUI-subsystem process with no console, so an error returned
+    // from here is completely invisible: no icon, no message, and nothing in the
+    // log because logging is not up yet. A config we cannot read therefore
+    // degrades to defaults and is reported through the log, rather than exiting
+    // and leaving the user with an app that silently never appears.
+    let (cfg, problem) = config::load_config_or_default();
     init_logging(&cfg);
+    if let Some(err) = problem {
+        tracing::warn!("config: {err:#}");
+    }
     crate::tray::run_tray_app(cfg)
 }
 
