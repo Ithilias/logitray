@@ -11,7 +11,7 @@ logitray sits in your system tray and talks to your Logitech wireless devices di
 - Live battery level for any wireless Logitech device (mouse, keyboard, trackball), right in the system tray
 - Two view modes: a color-coded **battery glyph**, or the **percentage as text** — switch any time from the menu
 - Color coding: green (healthy), orange (low), red (critical), blue (charging)
-- Hover the icon for every device's name and exact percentage, one per line
+- Hover the icon for each device's name and exact percentage, one per line, trimmed to a `+N more` marker if they do not all fit
 - Automatic low-battery notifications, with a cooldown so they don't spam you
 - Multiple devices: every paired device is monitored and alerted on; pick which one the tray icon follows
 - Manual "Refresh now" any time
@@ -45,7 +45,7 @@ Right-click the icon for the menu:
 - **Open config file…** — open `config.toml` in the default editor
 - **Exit**
 
-Icon colors: **green** ≥ 36%, **orange** 16–35%, **red** ≤ 15%, **blue** while charging.
+Icon colors follow the low-battery threshold, so the icon turns red exactly when a toast would fire: **red** at or below the threshold, **orange** from there up to 20 points above it (never below 35%), **green** above that, **blue** while charging. At the default threshold of 15% that reads green ≥ 36%, orange 16–35%, red ≤ 15%. Raise the threshold to 30% and 50% is orange, with green starting at 51%.
 
 ## Which device the icon follows
 
@@ -53,7 +53,7 @@ By default the tray follows **Automatic (lowest battery)**: the icon and status 
 
 Automatic passes over devices that are charging, so a mouse resting on its cable does not take the icon from a keyboard that is actually running low. If every device is charging, the lowest of them is shown. It also only hands the icon over once another device is at least 5 points lower, so two devices sitting at similar levels do not make it flip back and forth.
 
-The tooltip lists every device either way. In `text` view mode the icon is a bare number with no name attached, so under Automatic the tooltip or the status line is what tells you which device it belongs to.
+The tooltip lists the other devices either way, trimming the tail to a `+N more` marker when they do not all fit. In `text` view mode the icon is a bare number with no name attached, so under Automatic the tooltip or the status line is what tells you which device it belongs to.
 
 ## Language
 
@@ -92,6 +92,7 @@ Configuration lives in `%APPDATA%\logitray\config.toml` (created on first run):
 | `poll_interval_seconds` | `180` | Backstop re-read interval. Battery/charging changes are pushed via notifications; this only bounds the fallback re-read (and recovery after sleep). |
 | `low_battery_threshold` | `15` | Percent at/below which a low-battery toast fires |
 | `low_battery_cooldown_minutes` | `120` | Minimum time between repeat alerts per device |
+| `notifications_enabled` | `true` | Whether low-battery toasts are shown at all |
 | `selected_device_id` | `"lowest"` | Which device the tray follows: `"lowest"` for Automatic (lowest battery), or a device key chosen from the menu |
 | `autostart` | `false` | Start logitray when you log in |
 | `log_level` | `"info"` | Log verbosity (`error`/`warn`/`info`/`debug`/`trace`). Applies to logitray's own output; dependencies are capped at `info` so `debug` doesn't fill the log with HTTP internals from the update check. |
