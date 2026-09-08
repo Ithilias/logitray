@@ -6,6 +6,11 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Sentinel `selected_device_id` meaning "follow whichever connected device has
+/// the lowest battery" instead of a fixed device. Real keys are `"PID:index"`
+/// (see `device_key`), so a colon-free sentinel cannot collide with one.
+pub const AUTO_SUBJECT_ID: &str = "lowest";
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -60,7 +65,11 @@ impl Default for AppConfig {
             poll_interval_seconds: 180,
             low_battery_threshold: 15,
             low_battery_cooldown_minutes: 120,
-            selected_device_id: String::new(),
+            // Fresh installs follow the lowest battery: with one device it is the
+            // same behaviour as pinning it, and with several the icon answers
+            // "is anything about to die?". Configs that already name a device
+            // keep that device.
+            selected_device_id: AUTO_SUBJECT_ID.to_string(),
             autostart: false,
             log_level: "info".to_string(),
             view_mode: default_view_mode(),
@@ -227,7 +236,7 @@ pub fn save_device_profiles(profiles: &DeviceProfiles) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppConfig, DeviceProfile, DeviceProfiles};
+    use super::{AppConfig, DeviceProfile, DeviceProfiles, AUTO_SUBJECT_ID};
 
     /// Serializes the default config without `key`, appends `line` if given,
     /// then loads, saves and reloads it, returning both parsed configs.
@@ -344,6 +353,33 @@ mod tests {
         assert_eq!(parsed.autostart, cfg.autostart);
         assert_eq!(parsed.view_mode, cfg.view_mode);
         assert_eq!(parsed.notifications_enabled, cfg.notifications_enabled);
+    }
+
+    #[test]
+    fn fresh_configs_follow_the_lowest_battery() {
+        assert_eq!(AppConfig::default().selected_device_id, AUTO_SUBJECT_ID);
+    }
+
+    /// The sentinel, a real device key and the empty string left by older
+    /// versions all have to survive a load/save/reload cycle unchanged.
+    #[test]
+    fn selected_device_id_roundtrips() {
+        let actual: Vec<_> = [AUTO_SUBJECT_ID, "C547:1", ""]
+            .into_iter()
+            .map(|value| {
+                let line = format!("selected_device_id = \"{value}\"");
+                let (cfg, restored) = reload_with("selected_device_id", Some(line));
+                (cfg.selected_device_id, restored.selected_device_id)
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                ("lowest".to_string(), "lowest".to_string()),
+                ("C547:1".to_string(), "C547:1".to_string()),
+                (String::new(), String::new()),
+            ]
+        );
     }
 
     #[test]

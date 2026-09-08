@@ -31,8 +31,8 @@ No installer, no admin rights, no Logitech software needed. logitray does not st
 
 Right-click the icon for the menu:
 
-- **Status line** — the selected device and its battery (e.g. `G502 X Plus: 76%`)
-- **Select Device** — choose which device the tray follows when more than one is paired
+- **Status line** — the device the icon follows and its battery (e.g. `G502 X Plus: 76%`)
+- **Select Device** — **Automatic (lowest battery)**, the default, or a specific device to pin the icon to (see Which device the icon follows below)
 - **Refresh now** — re-check all devices immediately instead of waiting for the backstop re-read
 - **Show percentage as text** — toggle between the battery-glyph icon and the percentage-number icon
 - **Language** — Automatic (Windows language), English, or 简体中文
@@ -46,6 +46,14 @@ Right-click the icon for the menu:
 - **Exit**
 
 Icon colors: **green** ≥ 36%, **orange** 16–35%, **red** ≤ 15%, **blue** while charging.
+
+## Which device the icon follows
+
+By default the tray follows **Automatic (lowest battery)**: the icon and status line show whichever connected device is closest to running out, so one glance answers "is anything about to die?". With a single device this is exactly the same as following that device. To pin the icon to one device instead, choose it from **Select Device**.
+
+Automatic passes over devices that are charging, so a mouse resting on its cable does not take the icon from a keyboard that is actually running low. If every device is charging, the lowest of them is shown. It also only hands the icon over once another device is at least 5 points lower, so two devices sitting at similar levels do not make it flip back and forth.
+
+The tooltip lists every device either way. In `text` view mode the icon is a bare number with no name attached, so under Automatic the tooltip or the status line is what tells you which device it belongs to.
 
 ## Language
 
@@ -84,7 +92,7 @@ Configuration lives in `%APPDATA%\logitray\config.toml` (created on first run):
 | `poll_interval_seconds` | `180` | Backstop re-read interval. Battery/charging changes are pushed via notifications; this only bounds the fallback re-read (and recovery after sleep). |
 | `low_battery_threshold` | `15` | Percent at/below which a low-battery toast fires |
 | `low_battery_cooldown_minutes` | `120` | Minimum time between repeat alerts per device |
-| `selected_device_id` | `""` | Which device the tray follows (set via the menu) |
+| `selected_device_id` | `"lowest"` | Which device the tray follows: `"lowest"` for Automatic (lowest battery), or a device key chosen from the menu |
 | `autostart` | `false` | Start logitray when you log in |
 | `log_level` | `"info"` | Log verbosity (`error`/`warn`/`info`/`debug`/`trace`). Applies to logitray's own output; dependencies are capped at `info` so `debug` doesn't fill the log with HTTP internals from the update check. |
 | `language` | `"auto"` | UI language: `auto` (Windows display language), `en`, or `zh-CN`. Unknown values fall back to English. |
