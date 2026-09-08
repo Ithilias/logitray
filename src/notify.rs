@@ -3,6 +3,19 @@ use crate::model::BatteryState;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
+/// Floor for the repeat-alert cooldown.
+///
+/// Zero would not mean "do not repeat", it would mean no cooldown at all, since
+/// nothing is ever less than Duration::ZERO. The config file is hand-editable
+/// and unvalidated, so a user setting `low_battery_cooldown_minutes = 0` would
+/// get a toast on every pushed battery event and every safety re-read for as
+/// long as the device stayed below the threshold.
+const MIN_COOLDOWN: Duration = Duration::from_secs(60);
+
+fn cooldown_from_minutes(minutes: u64) -> Duration {
+    Duration::from_secs(minutes.saturating_mul(60)).max(MIN_COOLDOWN)
+}
+
 pub struct Notifier {
     language: Language,
     enabled: bool,
@@ -17,7 +30,7 @@ impl Notifier {
             language,
             enabled,
             threshold,
-            cooldown: Duration::from_secs(cooldown_minutes.saturating_mul(60)),
+            cooldown: cooldown_from_minutes(cooldown_minutes),
             last_sent: HashMap::new(),
         }
     }
@@ -35,7 +48,7 @@ impl Notifier {
     }
 
     pub fn set_cooldown(&mut self, cooldown_minutes: u64) {
-        self.cooldown = Duration::from_secs(cooldown_minutes.saturating_mul(60));
+        self.cooldown = cooldown_from_minutes(cooldown_minutes);
     }
 
     fn should_notify(&self, state: &BatteryState, now: Instant) -> bool {
@@ -215,6 +228,30 @@ mod tests {
 
         // The next dip is a new episode, well inside the 120 minute cooldown.
         assert!(notifier.should_notify(&low, now + Duration::from_secs(60)));
+    }
+
+    /// A cooldown of zero has to mean "the shortest cooldown we allow", not "no
+    /// cooldown", or the alert turns into a toast on every battery event.
+    #[test]
+    fn a_zero_cooldown_still_suppresses_repeats() {
+        let mut notifier = Notifier::new(Language::English, true, 15, 0);
+        let state = make_state(10, false);
+        let now = Instant::now();
+
+        assert!(notifier.should_notify(&state, now));
+        notifier.last_sent.insert(state.device_key.clone(), now);
+
+        // This was true before the floor, so every pushed HID++ battery event
+        // and every safety re-read produced another toast.
+        assert!(!notifier.should_notify(&state, now + Duration::from_secs(30)));
+        assert!(notifier.should_notify(&state, now + Duration::from_secs(61)));
+    }
+
+    /// The menu presets start at 30 minutes, so the floor must not disturb them.
+    #[test]
+    fn a_normal_cooldown_is_left_alone() {
+        let notifier = Notifier::new(Language::English, true, 15, 30);
+        assert_eq!(notifier.cooldown, Duration::from_secs(30 * 60));
     }
 
     #[test]
