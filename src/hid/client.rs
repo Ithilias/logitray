@@ -473,17 +473,17 @@ fn resolve_device(
     // Persist what we learned so the next cold boot can skip all of the above.
     if wpid != 0 {
         if let Some((id, idx)) = battery {
-            let changed = profiles.upsert(
-                wpid,
-                DeviceProfile {
-                    battery_feature_id: id,
-                    battery_feature_index: idx,
-                    name: display_name.clone(),
-                },
-            );
-            if changed {
-                if let Err(err) = config::save_device_profiles(profiles) {
-                    tracing::debug!("failed saving device profiles: {err}");
+            let profile = DeviceProfile {
+                battery_feature_id: id,
+                battery_feature_index: idx,
+                name: display_name.clone(),
+            };
+            // Update this worker's own snapshot, then merge the one entry into
+            // the file. Writing the whole snapshot back would drop whatever
+            // another receiver's worker has learned since this thread started.
+            if profiles.upsert(wpid, profile.clone()) {
+                if let Err(err) = config::save_device_profile(wpid, profile) {
+                    tracing::debug!("failed saving device profile: {err}");
                 }
             }
         }

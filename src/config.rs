@@ -5,6 +5,8 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// Sentinel `selected_device_id` meaning "follow whichever connected device has
 /// the lowest battery" instead of a fixed device. Real keys are `"PID:index"`
@@ -133,6 +135,13 @@ pub fn log_path() -> PathBuf {
     app_data_dir().join(format!("{APP_ID}.log"))
 }
 
+/// Makes each in-flight temp file name unique within the process.
+static TMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+/// Serializes the read-modify-write in [`save_device_profile`] across receiver
+/// worker threads.
+static PROFILE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
 fn write_atomic(path: &Path, raw: &[u8]) -> Result<()> {
     let parent = path
         .parent()
@@ -143,7 +152,12 @@ fn write_atomic(path: &Path, raw: &[u8]) -> Result<()> {
         .with_context(|| format!("missing file name for {}", path.display()))?
         .to_string_lossy();
 
-    let tmp_path = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
+    // The pid keeps this clear of other processes and the counter keeps it clear
+    // of our own threads: receiver workers each persist device profiles from
+    // their own thread, and a shared temp name lets one truncate another's
+    // half-written file and rename the result into place.
+    let unique = TMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(".{file_name}.{}.{unique}.tmp", std::process::id()));
     {
         let mut tmp = fs::File::create(&tmp_path)
             .with_context(|| format!("failed creating {}", tmp_path.display()))?;
@@ -153,11 +167,11 @@ fn write_atomic(path: &Path, raw: &[u8]) -> Result<()> {
             .with_context(|| format!("failed syncing {}", tmp_path.display()))?;
     }
 
-    #[cfg(target_os = "windows")]
-    if path.exists() {
-        fs::remove_file(path).with_context(|| format!("failed replacing {}", path.display()))?;
-    }
-
+    // No remove-then-rename dance: fs::rename already replaces the destination
+    // on Windows (MoveFileExW with MOVEFILE_REPLACE_EXISTING). Deleting first
+    // bought nothing and opened a window where the file did not exist at all,
+    // so a crash or a failed rename left the user with no config, which the next
+    // launch silently replaced with defaults.
     if let Err(err) = fs::rename(&tmp_path, path) {
         let _ = fs::remove_file(&tmp_path);
         return Err(err).with_context(|| {
@@ -301,7 +315,31 @@ pub fn load_device_profiles() -> DeviceProfiles {
     toml::from_str(&raw).unwrap_or_default()
 }
 
-pub fn save_device_profiles(profiles: &DeviceProfiles) -> Result<()> {
+/// Persist one learned profile without discarding what other receiver workers
+/// have learned in the meantime.
+///
+/// Each worker loads its own snapshot when its thread starts and never sees
+/// another's additions, so writing that snapshot back drops them: two receivers
+/// enumerating at once ends with only the second one's device cached, and the
+/// first re-runs the slow HID++ feature enumeration on the next cold boot. Read
+/// the file, merge the single entry, write it back, all under a lock so two
+/// workers cannot interleave.
+pub fn save_device_profile(wpid: u16, profile: DeviceProfile) -> Result<()> {
+    let _guard = PROFILE_WRITE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+    let mut on_disk = load_device_profiles();
+    if !on_disk.upsert(wpid, profile) {
+        // Another worker already wrote an identical entry.
+        return Ok(());
+    }
+    save_device_profiles(&on_disk)
+}
+
+/// Private on purpose: writing a whole snapshot is what loses another
+/// worker's entries. Callers go through [`save_device_profile`].
+fn save_device_profiles(profiles: &DeviceProfiles) -> Result<()> {
     let raw = toml::to_string_pretty(profiles).context("failed serializing device profiles")?;
     write_atomic(&device_profiles_path(), raw.as_bytes())?;
     Ok(())
@@ -384,6 +422,29 @@ mod tests {
                 ("v0.4.0".to_string(), "v0.4.0".to_string()),
             ]
         );
+    }
+
+    /// The basis for dropping the remove-then-rename dance: a plain rename over
+    /// an existing file replaces it, and leaves no temp file behind.
+    #[test]
+    fn write_atomic_replaces_an_existing_file() {
+        let dir =
+            std::env::temp_dir().join(format!("logitray-write-atomic-{}", std::process::id()));
+        let path = dir.join("thing.toml");
+
+        super::write_atomic(&path, b"first").expect("first write");
+        super::write_atomic(&path, b"second").expect("replacing write");
+        assert_eq!(std::fs::read_to_string(&path).expect("read back"), "second");
+
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .expect("read dir")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.ends_with(".tmp"))
+            .collect();
+        assert!(strays.is_empty(), "left temp files behind: {strays:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
