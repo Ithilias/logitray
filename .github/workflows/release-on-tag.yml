@@ -24,12 +24,13 @@ jobs:
 
       - name: Verify tag matches Cargo.toml version
         shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          tag="${{ github.ref_name }}"
           cargo_version="v$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          if [ "$tag" != "$cargo_version" ]; then
-            echo "::error::Tag '$tag' does not match Cargo.toml version '$cargo_version'"
+          if [ "$TAG" != "$cargo_version" ]; then
+            echo "::error::Tag '$TAG' does not match Cargo.toml version '$cargo_version'"
             exit 1
           fi
 
@@ -56,10 +57,11 @@ jobs:
       - name: Determine release notes range
         id: release_notes
         shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          tag="${{ github.ref_name }}"
-          if prev_tag=$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null); then
+          if prev_tag=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null); then
             echo "prev_tag=$prev_tag" >> "$GITHUB_OUTPUT"
           else
             echo "prev_tag=" >> "$GITHUB_OUTPUT"
@@ -68,16 +70,16 @@ jobs:
       - name: Create or update GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+          PREV_TAG: ${{ steps.release_notes.outputs.prev_tag }}
         shell: bash
         run: |
           set -euo pipefail
-          tag="${{ github.ref_name }}"
-          prev_tag="${{ steps.release_notes.outputs.prev_tag }}"
-          release_args=(--title "$tag" --generate-notes)
-          if [ -n "$prev_tag" ]; then
-            release_args+=(--notes-start-tag "$prev_tag")
+          release_args=(--title "$TAG" --generate-notes)
+          if [ -n "$PREV_TAG" ]; then
+            release_args+=(--notes-start-tag "$PREV_TAG")
           fi
-          if ! gh release view "$tag" > /dev/null 2>&1; then
-            gh release create "$tag" "${release_args[@]}"
+          if ! gh release view "$TAG" > /dev/null 2>&1; then
+            gh release create "$TAG" "${release_args[@]}"
           fi
-          gh release upload "$tag" logitray.exe SHA256SUMS.txt --clobber
+          gh release upload "$TAG" logitray.exe SHA256SUMS.txt --clobber
