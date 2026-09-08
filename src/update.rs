@@ -110,7 +110,8 @@ pub struct Schedule {
     /// the network coming up and a first-time user can opt out beforehand.
     pub first_delay: Duration,
     pub interval: Duration,
-    /// Used instead of `interval` after a failed check.
+    /// First wait after a failed check. Each further consecutive failure
+    /// doubles it, up to `interval`.
     pub retry: Duration,
 }
 
@@ -122,6 +123,20 @@ impl Default for Schedule {
             retry: Duration::from_secs(10 * 60),
         }
     }
+}
+
+/// How long to wait after a failed check: double the last wait, capped at the
+/// normal interval.
+///
+/// A flat retry is right for a blip and wrong for a persistent failure, and
+/// persistent failures are easy to come by. A captive portal or corporate proxy
+/// answers the HEAD with a 200 HTML page, so the redirect check rejects it; a
+/// signed-out or private repo redirects to a login URL, whose last path segment
+/// does not parse as a version. Neither can ever succeed, and at a flat ten
+/// minutes that is 144 requests to github.com and 144 warnings in the log every
+/// day, indefinitely.
+fn next_retry(current: Duration, interval: Duration) -> Duration {
+    current.saturating_mul(2).min(interval)
 }
 
 /// Runs the periodic check on a background thread. Enabling via
@@ -148,6 +163,7 @@ fn run_checker(
     on_update: impl Fn(Version),
 ) {
     let mut next_check = Instant::now() + schedule.first_delay;
+    let mut retry = schedule.retry;
     loop {
         let command = if enabled {
             match rx.recv_timeout(next_check.saturating_duration_since(Instant::now())) {
@@ -164,7 +180,10 @@ fn run_checker(
 
         if let Some(CheckerCommand::SetEnabled(value)) = command {
             if value && !enabled {
+                // Turning the check back on is the user asking now, so start
+                // over rather than honouring a backoff from an earlier failure.
                 next_check = Instant::now();
+                retry = schedule.retry;
             }
             enabled = value;
             continue;
@@ -188,11 +207,14 @@ fn run_checker(
                                 "update check: {latest} is not newer than {current}"
                             ),
                         }
+                        retry = schedule.retry;
                         schedule.interval
                     }
                     Err(err) => {
-                        tracing::warn!("update check failed: {err:#}");
-                        schedule.retry
+                        let wait = retry;
+                        tracing::warn!("update check failed, next attempt in {wait:?}: {err:#}");
+                        retry = next_retry(wait, schedule.interval);
+                        wait
                     }
                 };
         }
@@ -389,6 +411,24 @@ mod tests {
         );
         assert_silent(&found_rx, 100);
         assert_eq!(found_rx.recv_timeout(Duration::from_secs(5)), Ok(NEWER));
+    }
+
+    /// A check that can never succeed must settle down instead of hammering
+    /// github.com every ten minutes for the life of the process.
+    #[test]
+    fn retries_back_off_and_cap_at_the_interval() {
+        let schedule = Schedule::default();
+        let mut waits = vec![schedule.retry];
+        for _ in 0..10 {
+            let last = *waits.last().expect("seeded above");
+            waits.push(next_retry(last, schedule.interval));
+        }
+        let minutes: Vec<u64> = waits.iter().map(|wait| wait.as_secs() / 60).collect();
+        // 10 minutes doubling to the 24 hour interval, then held there.
+        assert_eq!(
+            minutes,
+            [10, 20, 40, 80, 160, 320, 640, 1280, 1440, 1440, 1440]
+        );
     }
 
     #[test]
