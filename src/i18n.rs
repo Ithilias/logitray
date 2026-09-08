@@ -34,6 +34,9 @@ impl Language {
             // "{n}" is replaced with the number of devices that did not fit.
             Text::MoreDevices => ("+{n} more", "还有 {n} 个设备"),
             Text::SelectDevice => ("Select Device", "选择设备"),
+            // The Select Device entry that follows the lowest battery instead of
+            // a fixed device. Phrased like Text::Automatic above it.
+            Text::AutomaticLowest => ("Automatic (lowest battery)", "自动（电量最低）"),
             Text::Refresh => ("Refresh now", "立即刷新"),
             Text::TextMode => ("Show percentage as text", "以文字显示百分比"),
             Text::PollInterval => ("Poll interval", "轮询间隔"),
@@ -83,6 +86,7 @@ pub enum Text {
     SelectedDeviceOffline,
     MoreDevices,
     SelectDevice,
+    AutomaticLowest,
     Refresh,
     TextMode,
     PollInterval,

@@ -207,6 +207,21 @@ impl MenuHandles {
         }
         self.device_items.clear();
 
+        // Auto is a mode rather than a device, so it is offered even when
+        // nothing is connected. Its id shares the "device:" prefix, so the
+        // click handler and `set_selected` treat it like any other entry.
+        let auto = CheckMenuItem::with_id(
+            format!("device:{}", config::AUTO_SUBJECT_ID),
+            language.text(Text::AutomaticLowest),
+            true,
+            selected_id == config::AUTO_SUBJECT_ID,
+            None,
+        );
+        self.select_submenu.append(&auto)?;
+        self.device_items.push(auto);
+        self.select_submenu
+            .append(&PredefinedMenuItem::separator())?;
+
         if devices.is_empty() {
             let empty = MenuItem::new(language.text(Text::NoDevices), false, None);
             self.select_submenu.append(&empty)?;
@@ -440,7 +455,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     if let Err(err) = refresh_tray_visuals(
         &mut tray,
         &[],
-        "",
+        None,
         &menu.status_item,
         text_mode,
         menu.language,
@@ -448,7 +463,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     ) {
         tracing::warn!("failed initializing tray: {err}");
     }
-    if let Err(err) = menu.rebuild_device_menu(&[], "") {
+    if let Err(err) = menu.rebuild_device_menu(&[], &cfg.selected_device_id) {
         tracing::warn!("failed initializing device menu: {err}");
     }
     // Source of truth for what's currently connected, keyed by device_key. The
@@ -458,6 +473,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     let mut device_map: BTreeMap<String, BatteryState> = BTreeMap::new();
     let mut devices: Vec<BatteryState> = Vec::new();
     let mut selected_id = cfg.selected_device_id.clone();
+    let mut subject = SubjectTracker::default();
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -491,7 +507,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         if let Err(err) = refresh_tray_visuals(
                             &mut tray,
                             &devices,
-                            &selected_id,
+                            subject.pick(&devices, &selected_id),
                             &menu.status_item,
                             text_mode,
                             menu.language,
@@ -533,7 +549,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                                 if let Err(err) = refresh_tray_visuals(
                                     &mut tray,
                                     &devices,
-                                    &selected_id,
+                                    subject.pick(&devices, &selected_id),
                                     &menu.status_item,
                                     text_mode,
                                     menu.language,
@@ -601,7 +617,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         if let Err(err) = refresh_tray_visuals(
                             &mut tray,
                             &devices,
-                            &selected_id,
+                            subject.pick(&devices, &selected_id),
                             &menu.status_item,
                             text_mode,
                             menu.language,
@@ -638,7 +654,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                     if let Err(err) = refresh_tray_visuals(
                         &mut tray,
                         &devices,
-                        &selected_id,
+                        subject.pick(&devices, &selected_id),
                         &menu.status_item,
                         text_mode,
                         menu.language,
@@ -687,15 +703,13 @@ fn build_tray_icon(menu: &Menu, icon: Icon) -> Result<TrayIcon> {
 fn refresh_tray_visuals(
     tray: &mut TrayIcon,
     devices: &[BatteryState],
-    selected_id: &str,
+    subject: Option<&BatteryState>,
     status_item: &MenuItem,
     text_mode: bool,
     language: Language,
     low_battery_threshold: u8,
 ) -> Result<()> {
-    let selected = devices.iter().find(|d| d.device_key == selected_id);
-
-    if let Some(device) = selected {
+    if let Some(device) = subject {
         let icon = if text_mode {
             icon::text_icon(
                 device.battery_percent,
@@ -724,8 +738,9 @@ fn refresh_tray_visuals(
         status_item.set_text(&status);
     } else {
         // Nothing at all, versus the chosen device being away while others are
-        // present. The second case is now reachable, because the choice is no
-        // longer silently re-pointed at whatever is still connected.
+        // present. The second case is reachable only with a pinned device,
+        // because the choice is no longer silently re-pointed at whatever is
+        // still connected; Auto always has a subject when anything is present.
         let message = if devices.is_empty() {
             language.text(Text::NoDevicesFound)
         } else {
@@ -737,6 +752,82 @@ fn refresh_tray_visuals(
     }
 
     Ok(())
+}
+
+/// How much lower a candidate's battery must be before Auto mode hands the icon
+/// over. HID++ reports coarse, discrete levels, so near-ties are common and an
+/// exact comparison would flap the icon between two devices as they drift.
+const AUTO_SWITCH_MARGIN: u8 = 5;
+
+/// The device the icon speaks for: the pinned one, or under
+/// [`config::AUTO_SUBJECT_ID`] whichever connected device is closest to dying.
+///
+/// Charging devices are not candidates. Otherwise a mouse sitting on the cable
+/// at 12% would take the icon, paint it blue, and hide a keyboard at 20%. When
+/// everything is charging there is nothing to warn about, so the lowest overall
+/// is used and the icon still shows something real.
+///
+/// `current` is the subject from the previous pass and is kept unless a
+/// candidate is lower by at least [`AUTO_SWITCH_MARGIN`], so an exact tie leaves
+/// the icon alone. A subject that starts charging or disappears leaves the pool
+/// and is replaced at once.
+fn pick_subject<'a>(
+    devices: &'a [BatteryState],
+    selected_id: &str,
+    current: Option<&str>,
+) -> Option<&'a BatteryState> {
+    if selected_id != config::AUTO_SUBJECT_ID {
+        return devices
+            .iter()
+            .find(|device| device.device_key == selected_id);
+    }
+
+    // Both are bound before the choice: collecting inside the branch would
+    // build a temporary that is dropped at the end of the expression.
+    let discharging: Vec<&BatteryState> = devices
+        .iter()
+        .filter(|device| !device.is_charging)
+        .collect();
+    let all: Vec<&BatteryState> = devices.iter().collect();
+    let pool = if discharging.is_empty() {
+        &all
+    } else {
+        &discharging
+    };
+
+    // min_by_key keeps the first minimum and the caller passes `sorted_devices`
+    // output, so equal levels resolve to the same device on every pass.
+    let lowest = *pool.iter().min_by_key(|device| device.battery_percent)?;
+    let incumbent = current.and_then(|key| pool.iter().find(|d| d.device_key == key).copied());
+
+    match incumbent {
+        Some(held)
+            if held.battery_percent.saturating_sub(lowest.battery_percent) < AUTO_SWITCH_MARGIN =>
+        {
+            Some(held)
+        }
+        _ => Some(lowest),
+    }
+}
+
+/// The subject the icon last spoke for, which [`pick_subject`] needs to apply
+/// its hysteresis. It lives here rather than in the config because under Auto it
+/// changes whenever two batteries cross, and persisting every crossover would
+/// churn `config.toml` over derived state.
+#[derive(Default)]
+struct SubjectTracker(Option<String>);
+
+impl SubjectTracker {
+    /// Re-pick the subject for the current device list and remember it.
+    fn pick<'a>(
+        &mut self,
+        devices: &'a [BatteryState],
+        selected_id: &str,
+    ) -> Option<&'a BatteryState> {
+        let picked = pick_subject(devices, selected_id, self.0.as_deref());
+        self.0 = picked.map(|device| device.device_key.clone());
+        picked
+    }
 }
 
 /// Adopt a device on first run, when the user has not chosen one yet.
@@ -857,7 +948,11 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{adopt_initial_device, battery_label, tooltip_text, utf16_len, TOOLTIP_BUDGET};
+    use super::{
+        adopt_initial_device, battery_label, pick_subject, tooltip_text, utf16_len, SubjectTracker,
+        TOOLTIP_BUDGET,
+    };
+    use crate::config::AUTO_SUBJECT_ID;
     use crate::i18n::Language;
     use crate::model::BatteryState;
 
@@ -912,6 +1007,145 @@ mod tests {
         let mut selected = String::new();
         assert!(!adopt_initial_device(&mut selected, &[]));
         assert_eq!(selected, "");
+    }
+
+    /// A fresh config already reads "lowest", so first-run adoption must leave
+    /// it alone rather than pinning whatever showed up first.
+    #[test]
+    fn auto_is_not_replaced_by_the_first_device_seen() {
+        let mut selected = AUTO_SUBJECT_ID.to_string();
+        assert!(!adopt_initial_device(&mut selected, &[mk("a")]));
+        assert_eq!(selected, AUTO_SUBJECT_ID);
+    }
+
+    fn at(id: &str, percent: u8) -> BatteryState {
+        BatteryState {
+            battery_percent: percent,
+            ..mk(id)
+        }
+    }
+
+    fn charging_at(id: &str, percent: u8) -> BatteryState {
+        BatteryState {
+            is_charging: true,
+            ..at(id, percent)
+        }
+    }
+
+    fn subject_key(
+        devices: &[BatteryState],
+        selected: &str,
+        current: Option<&str>,
+    ) -> Option<String> {
+        pick_subject(devices, selected, current).map(|device| device.device_key.clone())
+    }
+
+    #[test]
+    fn a_pinned_device_is_followed_whatever_its_battery() {
+        let devices = vec![at("a", 90), at("b", 5)];
+        assert_eq!(subject_key(&devices, "a", None).as_deref(), Some("a"));
+        // Absent means no subject at all, not a silent fall back to another
+        // device: that is what the "Selected device not connected" line is for.
+        assert_eq!(subject_key(&devices, "missing", None), None);
+    }
+
+    #[test]
+    fn auto_follows_the_lowest_battery() {
+        let devices = vec![at("a", 90), at("b", 42), at("c", 12)];
+        assert_eq!(
+            subject_key(&devices, AUTO_SUBJECT_ID, None).as_deref(),
+            Some("c")
+        );
+        assert_eq!(subject_key(&[], AUTO_SUBJECT_ID, None), None);
+    }
+
+    /// A mouse resting on its cable must not take the icon, paint it blue and
+    /// hide a keyboard that is actually running out.
+    #[test]
+    fn auto_skips_charging_devices() {
+        let devices = vec![charging_at("a", 5), at("b", 20)];
+        assert_eq!(
+            subject_key(&devices, AUTO_SUBJECT_ID, None).as_deref(),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn auto_falls_back_to_the_lowest_when_everything_is_charging() {
+        let devices = vec![charging_at("a", 60), charging_at("b", 30)];
+        assert_eq!(
+            subject_key(&devices, AUTO_SUBJECT_ID, None).as_deref(),
+            Some("b")
+        );
+    }
+
+    /// The margin is 5 points, so 40 against 36 holds and 40 against 35 gives way.
+    #[test]
+    fn auto_switches_only_once_a_candidate_is_clearly_lower() {
+        let held = vec![at("a", 40), at("b", 36)];
+        assert_eq!(
+            subject_key(&held, AUTO_SUBJECT_ID, Some("a")).as_deref(),
+            Some("a")
+        );
+        let switched = vec![at("a", 40), at("b", 35)];
+        assert_eq!(
+            subject_key(&switched, AUTO_SUBJECT_ID, Some("a")).as_deref(),
+            Some("b")
+        );
+    }
+
+    /// 0x1000 reports coarse discrete levels, so exact ties are common.
+    #[test]
+    fn auto_keeps_the_incumbent_on_a_tie() {
+        let devices = vec![at("a", 30), at("b", 30)];
+        assert_eq!(
+            subject_key(&devices, AUTO_SUBJECT_ID, Some("b")).as_deref(),
+            Some("b")
+        );
+        // With no incumbent, sorted order decides, so the pick is repeatable.
+        assert_eq!(
+            subject_key(&devices, AUTO_SUBJECT_ID, None).as_deref(),
+            Some("a")
+        );
+    }
+
+    /// Hysteresis protects a subject that is still a candidate. One that starts
+    /// charging or vanishes is not, and is handed over at once.
+    #[test]
+    fn auto_replaces_a_subject_that_charges_or_disappears() {
+        let charging = vec![charging_at("a", 10), at("b", 80)];
+        assert_eq!(
+            subject_key(&charging, AUTO_SUBJECT_ID, Some("a")).as_deref(),
+            Some("b")
+        );
+        let gone = vec![at("b", 80)];
+        assert_eq!(
+            subject_key(&gone, AUTO_SUBJECT_ID, Some("a")).as_deref(),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn the_tracker_carries_the_subject_across_passes() {
+        let mut subject = SubjectTracker::default();
+        let key = |picked: Option<&BatteryState>| picked.map(|d| d.device_key.clone());
+
+        let first = vec![at("a", 40), at("b", 80)];
+        assert_eq!(
+            key(subject.pick(&first, AUTO_SUBJECT_ID)).as_deref(),
+            Some("a")
+        );
+        // b drops below a without clearing the margin, so the icon holds still.
+        let second = vec![at("a", 40), at("b", 38)];
+        assert_eq!(
+            key(subject.pick(&second, AUTO_SUBJECT_ID)).as_deref(),
+            Some("a")
+        );
+        let third = vec![at("a", 40), at("b", 34)];
+        assert_eq!(
+            key(subject.pick(&third, AUTO_SUBJECT_ID)).as_deref(),
+            Some("b")
+        );
     }
 
     fn named(id: &str, name: &str, percent: u8) -> BatteryState {
