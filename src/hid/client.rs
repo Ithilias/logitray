@@ -72,8 +72,15 @@ impl FeatureCache {
 pub enum DeviceEvent {
     /// A device arrived or its battery reading changed.
     Update(BatteryState),
-    /// A device's link dropped (or its receiver went away); `device_key`.
+    /// A device's link dropped; `device_key`.
     Gone(String),
+    /// A whole receiver is no longer attached, so everything behind it is gone.
+    ///
+    /// Needed because `Gone` only ever comes from a link-down notification, and
+    /// an unplugged receiver cannot send one: the worker either dies mid-read or
+    /// (with no short collection) never notices at all. Without this the tray
+    /// keeps every device the receiver was carrying.
+    ReceiverGone(u16),
 }
 
 /// Commands the tray sends to a receiver worker.

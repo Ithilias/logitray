@@ -11,7 +11,7 @@ use crate::update::{self, CheckerCommand, Version};
 use crate::APP_ID;
 use anyhow::{Context, Result};
 use hidapi::HidApi;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -652,6 +652,9 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         DeviceEvent::Gone(key) => {
                             device_map.remove(&key);
                         }
+                        DeviceEvent::ReceiverGone(pid) => {
+                            forget_receiver(&mut device_map, pid);
+                        }
                     }
 
                     devices = sorted_devices(&device_map);
@@ -863,6 +866,14 @@ fn adopt_initial_device(selected_id: &mut String, devices: &[BatteryState]) -> b
     true
 }
 
+/// Drop every device behind one receiver, for when the receiver itself is no
+/// longer attached. Device keys are "PID:index" (see `device_key`), so the
+/// receiver's devices are exactly those under the "PID:" prefix.
+fn forget_receiver(map: &mut BTreeMap<String, BatteryState>, pid: u16) {
+    let prefix = format!("{pid:04X}:");
+    map.retain(|key, _| !key.starts_with(&prefix));
+}
+
 /// Sorted view of the current device map, matching the ordering the old
 /// `PollResult::sort_devices` produced (by name, then pid, then key).
 fn sorted_devices(map: &BTreeMap<String, BatteryState>) -> Vec<BatteryState> {
@@ -895,31 +906,55 @@ fn spawn_supervisor(
         let mut safety_secs = safety_secs;
 
         loop {
-            // Drop workers whose thread has exited (receiver unplugged), so a
-            // re-plugged receiver gets a fresh worker below.
-            workers.retain(|_, (_, handle)| !handle.is_finished());
+            // Which receivers are attached right now. None means the scan itself
+            // failed, which must not be read as "everything went away".
+            let scanned = match HidApi::new() {
+                Ok(api) => Some(scan_receivers(&api)),
+                Err(err) => {
+                    tracing::warn!("failed initializing hidapi for scan: {err}");
+                    None
+                }
+            };
+            let present: Option<HashSet<u16>> = scanned
+                .as_ref()
+                .map(|receivers| receivers.iter().map(|r| r.pid).collect());
+
+            // Retire workers that have died, and workers whose receiver is no
+            // longer attached. Both need saying out loud: a worker that dies
+            // mid-read never emits Gone for the devices it knew, and one with no
+            // short collection has nothing that can fail, so it never dies at
+            // all and would hold its slot against a re-plug forever.
+            workers.retain(|pid, (tx, handle)| {
+                let unplugged = present.as_ref().is_some_and(|p| !p.contains(pid));
+                if !handle.is_finished() && !unplugged {
+                    return true;
+                }
+                if unplugged {
+                    tracing::info!("receiver {pid:04X} is gone, retiring its worker");
+                    let _ = tx.send(WorkerCommand::Exit);
+                }
+                let _ = proxy.send_event(UserEvent::Device(DeviceEvent::ReceiverGone(*pid)));
+                false
+            });
 
             // Spawn workers for any receiver we're not already tracking.
-            match HidApi::new() {
-                Ok(api) => {
-                    for receiver in scan_receivers(&api) {
-                        if workers.contains_key(&receiver.pid) {
-                            continue;
-                        }
-                        let (tx, rx) = mpsc::channel::<WorkerCommand>();
-                        let proxy = proxy.clone();
-                        let handle = client::spawn_receiver_worker(
-                            receiver.clone(),
-                            safety_secs,
-                            rx,
-                            move |event| {
-                                let _ = proxy.send_event(UserEvent::Device(event));
-                            },
-                        );
-                        workers.insert(receiver.pid, (tx, handle));
+            if let Some(receivers) = scanned {
+                for receiver in receivers {
+                    if workers.contains_key(&receiver.pid) {
+                        continue;
                     }
+                    let (tx, rx) = mpsc::channel::<WorkerCommand>();
+                    let proxy = proxy.clone();
+                    let handle = client::spawn_receiver_worker(
+                        receiver.clone(),
+                        safety_secs,
+                        rx,
+                        move |event| {
+                            let _ = proxy.send_event(UserEvent::Device(event));
+                        },
+                    );
+                    workers.insert(receiver.pid, (tx, handle));
                 }
-                Err(err) => tracing::warn!("failed initializing hidapi for scan: {err}"),
             }
 
             match cmd_rx.recv_timeout(Duration::from_secs(RESCAN_SECS)) {
@@ -964,12 +999,13 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        adopt_initial_device, battery_label, pick_subject, tooltip_text, utf16_len, SubjectTracker,
-        TOOLTIP_BUDGET,
+        adopt_initial_device, battery_label, forget_receiver, pick_subject, tooltip_text,
+        utf16_len, SubjectTracker, TOOLTIP_BUDGET,
     };
     use crate::config::AUTO_SUBJECT_ID;
     use crate::i18n::Language;
     use crate::model::BatteryState;
+    use std::collections::BTreeMap;
 
     fn mk(id: &str) -> BatteryState {
         BatteryState {
@@ -1161,6 +1197,32 @@ mod tests {
             key(subject.pick(&third, AUTO_SUBJECT_ID)).as_deref(),
             Some("b")
         );
+    }
+
+    /// An unplugged receiver takes its own devices with it and leaves every
+    /// other receiver's alone. Before this the devices simply stayed, and under
+    /// Auto the icon would happily go on speaking for absent hardware.
+    #[test]
+    fn forgetting_a_receiver_drops_exactly_its_devices() {
+        let mut map: BTreeMap<String, BatteryState> = ["C547:1", "C547:2", "C52B:1", "C5:47"]
+            .into_iter()
+            .map(|key| (key.to_string(), mk(key)))
+            .collect();
+
+        forget_receiver(&mut map, 0xC547);
+
+        let left: Vec<_> = map.keys().cloned().collect();
+        // "C5:47" survives: the prefix is "C547:", so a key that merely shares
+        // leading characters with the pid is not swept up with it.
+        assert_eq!(left, ["C52B:1", "C5:47"]);
+    }
+
+    #[test]
+    fn forgetting_an_unknown_receiver_changes_nothing() {
+        let mut map: BTreeMap<String, BatteryState> =
+            [("C547:1".to_string(), mk("C547:1"))].into_iter().collect();
+        forget_receiver(&mut map, 0x1234);
+        assert_eq!(map.len(), 1);
     }
 
     fn named(id: &str, name: &str, percent: u8) -> BatteryState {
