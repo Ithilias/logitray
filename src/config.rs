@@ -1,5 +1,5 @@
 use crate::APP_ID;
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
@@ -15,11 +15,17 @@ pub const AUTO_SUBJECT_ID: &str = "lowest";
 pub struct AppConfig {
     #[serde(default)]
     pub language: crate::i18n::Language,
+    #[serde(default = "default_poll_interval_seconds")]
     pub poll_interval_seconds: u64,
+    #[serde(default = "default_low_battery_threshold")]
     pub low_battery_threshold: u8,
+    #[serde(default = "default_low_battery_cooldown_minutes")]
     pub low_battery_cooldown_minutes: u64,
+    #[serde(default = "default_selected_device_id")]
     pub selected_device_id: String,
+    #[serde(default = "default_autostart")]
     pub autostart: bool,
+    #[serde(default = "default_log_level")]
     pub log_level: String,
     /// Tray display style: "icon" (battery glyph) or "text" (percentage number).
     #[serde(default = "default_view_mode")]
@@ -33,6 +39,36 @@ pub struct AppConfig {
     /// Release the update toast was last shown for, so restarts do not repeat it.
     #[serde(default)]
     pub last_notified_update: String,
+}
+
+/// Battery and charging changes are pushed via HID++ notifications, so this is
+/// only a backstop re-read for missed events and resume. A few minutes is
+/// plenty and keeps idle USB traffic low.
+fn default_poll_interval_seconds() -> u64 {
+    180
+}
+
+fn default_low_battery_threshold() -> u8 {
+    15
+}
+
+fn default_low_battery_cooldown_minutes() -> u64 {
+    120
+}
+
+/// Fresh installs follow the lowest battery: with one device it is the same
+/// behaviour as pinning it, and with several the icon answers "is anything
+/// about to die?". Configs that already name a device keep that device.
+fn default_selected_device_id() -> String {
+    AUTO_SUBJECT_ID.to_string()
+}
+
+fn default_autostart() -> bool {
+    false
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 fn default_view_mode() -> String {
@@ -58,20 +94,13 @@ impl AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
-            language: crate::i18n::Language::Auto,
-            // Battery and charging changes are pushed via HID++ notifications, so
-            // this is only a backstop re-read for missed events / resume — a few
-            // minutes is plenty and keeps idle USB traffic low.
-            poll_interval_seconds: 180,
-            low_battery_threshold: 15,
-            low_battery_cooldown_minutes: 120,
-            // Fresh installs follow the lowest battery: with one device it is the
-            // same behaviour as pinning it, and with several the icon answers
-            // "is anything about to die?". Configs that already name a device
-            // keep that device.
-            selected_device_id: AUTO_SUBJECT_ID.to_string(),
-            autostart: false,
-            log_level: "info".to_string(),
+            language: crate::i18n::Language::default(),
+            poll_interval_seconds: default_poll_interval_seconds(),
+            low_battery_threshold: default_low_battery_threshold(),
+            low_battery_cooldown_minutes: default_low_battery_cooldown_minutes(),
+            selected_device_id: default_selected_device_id(),
+            autostart: default_autostart(),
+            log_level: default_log_level(),
             view_mode: default_view_mode(),
             notifications_enabled: default_notifications_enabled(),
             check_for_updates: default_check_for_updates(),
@@ -156,6 +185,50 @@ pub fn load_or_create_config() -> Result<AppConfig> {
     let parsed: AppConfig =
         toml::from_str(&raw).with_context(|| format!("failed parsing {}", path.display()))?;
     Ok(parsed)
+}
+
+/// Where an unparsable `config.toml` is moved so falling back to defaults does
+/// not cost the user the file the moment the app next saves.
+pub fn invalid_config_path() -> PathBuf {
+    app_data_dir().join("config.toml.invalid")
+}
+
+/// Load the config for the tray, which has no console to report to and must not
+/// exit over a broken file.
+///
+/// A config that cannot be read or parsed is moved aside and replaced with
+/// defaults, so the app still starts and the user's original is still there to
+/// look at. The returned error describes what happened; the caller logs it once
+/// logging is up, because at this point it is not.
+pub fn load_config_or_default() -> (AppConfig, Option<anyhow::Error>) {
+    match load_or_create_config() {
+        Ok(cfg) => (cfg, None),
+        Err(err) => {
+            let cfg = AppConfig::default();
+            let note = preserve_invalid_config(err);
+            // Best effort: if this fails too, the app still runs on defaults.
+            let _ = save_config(&cfg);
+            (cfg, Some(note))
+        }
+    }
+}
+
+/// Move a config we could not parse out of the way, and describe the outcome.
+fn preserve_invalid_config(err: anyhow::Error) -> anyhow::Error {
+    let path = config_path();
+    if !path.exists() {
+        return anyhow!("{err:#}; starting from defaults");
+    }
+    let aside = invalid_config_path();
+    match fs::rename(&path, &aside) {
+        Ok(()) => anyhow!(
+            "{err:#}; moved it to {} and starting from defaults",
+            aside.display()
+        ),
+        Err(rename_err) => {
+            anyhow!("{err:#}; could not move it aside ({rename_err}), starting from defaults")
+        }
+    }
 }
 
 pub fn save_config(cfg: &AppConfig) -> Result<()> {
@@ -353,6 +426,46 @@ mod tests {
         assert_eq!(parsed.autostart, cfg.autostart);
         assert_eq!(parsed.view_mode, cfg.view_mode);
         assert_eq!(parsed.notifications_enabled, cfg.notifications_enabled);
+    }
+
+    /// A missing key must cost that key's value, not the whole file. These six
+    /// had no serde default, so deleting a single line by hand made the config
+    /// unparsable and the tray exited without a word.
+    #[test]
+    fn a_missing_key_falls_back_to_its_own_default() {
+        let d = AppConfig::default();
+        let missing = |key: &str| reload_with(key, None).0;
+        assert_eq!(
+            missing("poll_interval_seconds").poll_interval_seconds,
+            d.poll_interval_seconds
+        );
+        assert_eq!(
+            missing("low_battery_threshold").low_battery_threshold,
+            d.low_battery_threshold
+        );
+        assert_eq!(
+            missing("low_battery_cooldown_minutes").low_battery_cooldown_minutes,
+            d.low_battery_cooldown_minutes
+        );
+        assert_eq!(
+            missing("selected_device_id").selected_device_id,
+            d.selected_device_id
+        );
+        assert_eq!(missing("autostart").autostart, d.autostart);
+        assert_eq!(missing("log_level").log_level, d.log_level);
+    }
+
+    /// The limit case of the above: even an empty file is a usable config, so
+    /// there is no longer any content that stops the tray from starting.
+    #[test]
+    fn an_empty_config_parses_as_all_defaults() {
+        let cfg: AppConfig = toml::from_str("").expect("empty config parses");
+        let d = AppConfig::default();
+        assert_eq!(cfg.selected_device_id, d.selected_device_id);
+        assert_eq!(cfg.poll_interval_seconds, d.poll_interval_seconds);
+        assert_eq!(cfg.low_battery_threshold, d.low_battery_threshold);
+        assert_eq!(cfg.log_level, d.log_level);
+        assert_eq!(cfg.autostart, d.autostart);
     }
 
     #[test]
