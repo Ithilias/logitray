@@ -13,7 +13,7 @@ tao = "0.37"
 toml = "1.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-tray-icon = "0.24"
+tray-icon = "0.25"
 # Update check only. native-tls means Schannel with the Windows certificate store
 # (no rustls); win-system-proxy honours the proxy from Windows Internet Settings.
 ureq = { version = "3.4", default-features = false, features = ["native-tls", "win-system-proxy"] }
