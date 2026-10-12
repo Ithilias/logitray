@@ -228,8 +228,9 @@ impl MenuHandles {
             return Ok(());
         }
 
+        let pinned_key = find_selected_device(devices, selected_id).map(|d| d.device_key.as_str());
         for device in devices {
-            let checked = device.device_key == selected_id;
+            let checked = pinned_key == Some(device.device_key.as_str());
             let label = battery_label(
                 language,
                 &device.display_name,
@@ -653,7 +654,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                             device_map.remove(&key);
                         }
                         DeviceEvent::ReceiverGone(pid) => {
-                            forget_receiver(&mut device_map, pid);
+                            forget_receiver(&mut device_map, &pid);
                         }
                     }
 
@@ -777,6 +778,25 @@ fn refresh_tray_visuals(
 /// exact comparison would flap the icon between two devices as they drift.
 const AUTO_SWITCH_MARGIN: u8 = 5;
 
+fn find_selected_device<'a>(
+    devices: &'a [BatteryState],
+    selected_id: &str,
+) -> Option<&'a BatteryState> {
+    if let Some(device) = devices.iter().find(|d| d.device_key == selected_id) {
+        return Some(device);
+    }
+    // Older configs used PID:slot. Honour that choice only when it identifies
+    // exactly one present device; two identical receivers must not pick at random.
+    let (pid, slot) = selected_id.split_once(':')?;
+    let pid = u16::from_str_radix(pid, 16).ok()?;
+    let slot = slot.parse::<u8>().ok()?;
+    let mut matches = devices
+        .iter()
+        .filter(|d| d.pid == pid && d.device_index == slot);
+    let device = matches.next()?;
+    matches.next().is_none().then_some(device)
+}
+
 /// The device the icon speaks for: the pinned one, or under
 /// [`config::AUTO_SUBJECT_ID`] whichever connected device is closest to dying.
 ///
@@ -801,9 +821,7 @@ fn pick_subject<'a>(
     low_battery_threshold: u8,
 ) -> Option<&'a BatteryState> {
     if selected_id != config::AUTO_SUBJECT_ID {
-        return devices
-            .iter()
-            .find(|device| device.device_key == selected_id);
+        return find_selected_device(devices, selected_id);
     }
 
     // Both are bound before the choice: collecting inside the branch would
@@ -888,10 +906,10 @@ fn adopt_initial_device(selected_id: &mut String, devices: &[BatteryState]) -> b
 }
 
 /// Drop every device behind one receiver, for when the receiver itself is no
-/// longer attached. Device keys are "PID:index" (see `device_key`), so the
-/// receiver's devices are exactly those under the "PID:" prefix.
-fn forget_receiver(map: &mut BTreeMap<String, BatteryState>, pid: u16) {
-    let prefix = format!("{pid:04X}:");
+/// longer attached. Device keys are "receiver-path:index" (see `device_key`), so the
+/// receiver's devices are exactly those under the "receiver-path:" prefix.
+fn forget_receiver(map: &mut BTreeMap<String, BatteryState>, receiver: &str) {
+    let prefix = format!("{receiver}:");
     map.retain(|key, _| !key.starts_with(&prefix));
 }
 
@@ -921,8 +939,8 @@ fn spawn_supervisor(
     safety_secs: u64,
 ) {
     thread::spawn(move || {
-        // pid -> (command sender, join handle) for each live worker.
-        let mut workers: HashMap<u16, (mpsc::Sender<WorkerCommand>, thread::JoinHandle<()>)> =
+        // physical receiver identity -> (command sender, join handle) for each live worker.
+        let mut workers: HashMap<String, (mpsc::Sender<WorkerCommand>, thread::JoinHandle<()>)> =
             HashMap::new();
         let mut safety_secs = safety_secs;
 
@@ -936,9 +954,9 @@ fn spawn_supervisor(
                     None
                 }
             };
-            let present: Option<HashSet<u16>> = scanned
+            let present: Option<HashSet<String>> = scanned
                 .as_ref()
-                .map(|receivers| receivers.iter().map(|r| r.pid).collect());
+                .map(|receivers| receivers.iter().map(|r| r.key.clone()).collect());
 
             // Retire workers that have died, and workers whose receiver is no
             // longer attached. Both need saying out loud: a worker that dies
@@ -951,17 +969,17 @@ fn spawn_supervisor(
                     return true;
                 }
                 if unplugged {
-                    tracing::info!("receiver {pid:04X} is gone, retiring its worker");
+                    tracing::info!("receiver {pid} is gone, retiring its worker");
                     let _ = tx.send(WorkerCommand::Exit);
                 }
-                let _ = proxy.send_event(UserEvent::Device(DeviceEvent::ReceiverGone(*pid)));
+                let _ = proxy.send_event(UserEvent::Device(DeviceEvent::ReceiverGone(pid.clone())));
                 false
             });
 
             // Spawn workers for any receiver we're not already tracking.
             if let Some(receivers) = scanned {
                 for receiver in receivers {
-                    if workers.contains_key(&receiver.pid) {
+                    if workers.contains_key(&receiver.key) {
                         continue;
                     }
                     let (tx, rx) = mpsc::channel::<WorkerCommand>();
@@ -974,7 +992,7 @@ fn spawn_supervisor(
                             let _ = proxy.send_event(UserEvent::Device(event));
                         },
                     );
-                    workers.insert(receiver.pid, (tx, handle));
+                    workers.insert(receiver.key.clone(), (tx, handle));
                 }
             }
 
@@ -1020,8 +1038,8 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        adopt_initial_device, battery_label, forget_receiver, pick_subject, tooltip_text,
-        utf16_len, SubjectTracker, TOOLTIP_BUDGET,
+        adopt_initial_device, battery_label, find_selected_device, forget_receiver, pick_subject,
+        tooltip_text, utf16_len, SubjectTracker, TOOLTIP_BUDGET,
     };
     use crate::config::AUTO_SUBJECT_ID;
     use crate::i18n::Language;
@@ -1269,24 +1287,45 @@ mod tests {
     /// Auto the icon would happily go on speaking for absent hardware.
     #[test]
     fn forgetting_a_receiver_drops_exactly_its_devices() {
-        let mut map: BTreeMap<String, BatteryState> = ["C547:1", "C547:2", "C52B:1", "C5:47"]
-            .into_iter()
-            .map(|key| (key.to_string(), mk(key)))
-            .collect();
+        let mut map: BTreeMap<String, BatteryState> = [
+            "receiver-a:1",
+            "receiver-a:2",
+            "receiver-b:1",
+            "receiver-aa:1",
+        ]
+        .into_iter()
+        .map(|key| (key.to_string(), mk(key)))
+        .collect();
 
-        forget_receiver(&mut map, 0xC547);
+        forget_receiver(&mut map, "receiver-a");
 
         let left: Vec<_> = map.keys().cloned().collect();
-        // "C5:47" survives: the prefix is "C547:", so a key that merely shares
-        // leading characters with the pid is not swept up with it.
-        assert_eq!(left, ["C52B:1", "C5:47"]);
+        // A receiver whose identity only shares a prefix must survive.
+        assert_eq!(left, ["receiver-aa:1", "receiver-b:1"]);
+    }
+
+    #[test]
+    fn legacy_selection_is_preserved_only_when_unambiguous() {
+        let devices = vec![mk("receiver-a:1")];
+        assert_eq!(
+            find_selected_device(&devices, "C52B:1").unwrap().device_key,
+            "receiver-a:1"
+        );
+        let devices = vec![mk("receiver-a:1"), mk("receiver-b:1")];
+        assert!(find_selected_device(&devices, "C52B:1").is_none());
+        assert_eq!(
+            find_selected_device(&devices, "receiver-b:1")
+                .unwrap()
+                .device_key,
+            "receiver-b:1"
+        );
     }
 
     #[test]
     fn forgetting_an_unknown_receiver_changes_nothing() {
         let mut map: BTreeMap<String, BatteryState> =
             [("C547:1".to_string(), mk("C547:1"))].into_iter().collect();
-        forget_receiver(&mut map, 0x1234);
+        forget_receiver(&mut map, "1234");
         assert_eq!(map.len(), 1);
     }
 
