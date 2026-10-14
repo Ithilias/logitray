@@ -45,6 +45,9 @@ const MIN_SAFETY_SECS: u64 = 15;
 /// Highest device slot a receiver can pair (Unifying supports 6).
 const MAX_SLOT: u8 = 6;
 
+/// Direct USB HID++ devices address themselves at 0xFF.
+const DIRECT_DEVICE_INDEX: u8 = 0xFF;
+
 /// Per-device data that never changes while a device stays paired: which battery
 /// feature to use (and its table index) and the display name. Enumeration is
 /// many HID++ round-trips, so we do it once and reuse it. `battery` is `None`
@@ -52,9 +55,10 @@ const MAX_SLOT: u8 = 6;
 struct DeviceCache {
     battery: Option<(u16, u8)>,
     display_name: String,
+    wpid: u16,
 }
 
-/// Cache of [`DeviceCache`] keyed by `device_key` ("PID:index"), held for the
+/// Cache of [`DeviceCache`] keyed by `device_key` ("receiver-path:index"), held for the
 /// worker's lifetime.
 #[derive(Default)]
 pub struct FeatureCache {
@@ -80,7 +84,7 @@ pub enum DeviceEvent {
     /// an unplugged receiver cannot send one: the worker either dies mid-read or
     /// (with no short collection) never notices at all. Without this the tray
     /// keeps every device the receiver was carrying.
-    ReceiverGone(u16),
+    ReceiverGone(String),
 }
 
 /// Commands the tray sends to a receiver worker.
@@ -94,8 +98,8 @@ pub enum WorkerCommand {
     Exit,
 }
 
-fn device_key(pid: u16, slot: u8) -> String {
-    format!("{pid:04X}:{slot}")
+fn device_key(receiver: &ReceiverPath, slot: u8) -> String {
+    format!("{}:{slot}", receiver.key)
 }
 
 /// Spawn the worker thread for one receiver. `emit` is invoked (from the worker
@@ -130,6 +134,9 @@ where
     // both collections from the thread that uses them.
     let api = HidApi::new().context("failed to initialize hidapi")?;
     let mut long = open_receiver(&api, receiver).context("failed to open device interface")?;
+    if is_direct_device(&mut long) {
+        return run_direct_worker(&mut long, receiver, safety_secs, cmd_rx, emit);
+    }
     let short = open_notifier(&api, receiver).ok();
     if short.is_none() {
         tracing::info!(
@@ -152,7 +159,7 @@ where
     } else {
         discover_by_ping(
             &mut long,
-            receiver.pid,
+            receiver,
             &mut cache,
             &mut profiles,
             &mut known,
@@ -174,7 +181,7 @@ where
                             handle_connection(
                                 conn,
                                 &mut long,
-                                receiver.pid,
+                                receiver,
                                 &mut cache,
                                 &mut profiles,
                                 &mut known,
@@ -193,14 +200,7 @@ where
         // Drain any unsolicited HID++ 2.0 battery events the device pushed on the
         // long interface (e.g. charging started/stopped) and reflect them right
         // away rather than waiting for the safety re-read.
-        drain_long_events(
-            &mut long,
-            receiver.pid,
-            &mut cache,
-            &mut profiles,
-            &known,
-            emit,
-        );
+        drain_long_events(&mut long, receiver, &mut cache, &mut profiles, &known, emit);
 
         // Drain pending commands.
         loop {
@@ -211,14 +211,14 @@ where
                     } else {
                         discover_by_ping(
                             &mut long,
-                            receiver.pid,
+                            receiver,
                             &mut cache,
                             &mut profiles,
                             &mut known,
                             emit,
                         );
                     }
-                    reread_known(&mut long, receiver.pid, &mut cache, &known, emit);
+                    reread_known(&mut long, receiver, &mut cache, &known, emit);
                 }
                 Ok(WorkerCommand::SetSafetyInterval(secs)) => {
                     safety = Duration::from_secs(secs.max(MIN_SAFETY_SECS));
@@ -238,15 +238,90 @@ where
             } else {
                 discover_by_ping(
                     &mut long,
-                    receiver.pid,
+                    receiver,
                     &mut cache,
                     &mut profiles,
                     &mut known,
                     emit,
                 );
             }
-            reread_known(&mut long, receiver.pid, &mut cache, &known, emit);
+            reread_known(&mut long, receiver, &mut cache, &known, emit);
             last_safety = Instant::now();
+        }
+    }
+}
+
+// A receiver speaks HID++ 1.0 at 0xFF; a wired device answers the HID++ 2.0
+// root ping there. Verify both the protocol version and echo, rather than
+// inferring connection type from a product name or a guessed PID range.
+fn is_direct_device(long: &mut HidDevice) -> bool {
+    let echo = 0x55;
+    send_recv_with(
+        long,
+        ping(DIRECT_DEVICE_INDEX, echo),
+        PING_TIMEOUT_MS,
+        PING_RETRIES,
+    )
+    .is_ok_and(|reply| direct_ping_reply(&reply, echo))
+}
+
+fn direct_ping_reply(reply: &[u8; 7], echo: u8) -> bool {
+    reply[1] == DIRECT_DEVICE_INDEX && reply[4] >= 2 && reply[6] == echo
+}
+
+fn run_direct_worker<F>(
+    long: &mut HidDevice,
+    receiver: &ReceiverPath,
+    safety_secs: u64,
+    cmd_rx: &mpsc::Receiver<WorkerCommand>,
+    emit: &F,
+) -> Result<()>
+where
+    F: Fn(DeviceEvent),
+{
+    let mut cache = FeatureCache::new();
+    let mut profiles = config::load_device_profiles();
+    let mut known = BTreeSet::new();
+    let mut safety = Duration::from_secs(safety_secs.max(MIN_SAFETY_SECS));
+    let mut next_read = Instant::now();
+    loop {
+        if Instant::now() >= next_read {
+            match read_device(
+                long,
+                DIRECT_DEVICE_INDEX,
+                receiver,
+                0,
+                &mut cache,
+                &mut profiles,
+            ) {
+                Ok(Some(state)) => {
+                    known.insert(DIRECT_DEVICE_INDEX);
+                    emit(DeviceEvent::Update(state));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::debug!("USB device {:04X} battery read: {err}", receiver.pid);
+                    if forget_slot(receiver, DIRECT_DEVICE_INDEX, &mut cache, &mut known) {
+                        emit(DeviceEvent::Gone(device_key(receiver, DIRECT_DEVICE_INDEX)));
+                    }
+                }
+            }
+            next_read = Instant::now() + safety;
+        }
+        // Direct devices have no receiver connection announcements. Their
+        // battery events arrive on the long interface and use index 0xFF.
+        drain_long_events(long, receiver, &mut cache, &mut profiles, &known, emit);
+        let wait = next_read
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(1));
+        match cmd_rx.recv_timeout(wait) {
+            Ok(WorkerCommand::Refresh) => next_read = Instant::now(),
+            Ok(WorkerCommand::SetSafetyInterval(secs)) => {
+                safety = Duration::from_secs(secs.max(MIN_SAFETY_SECS));
+                next_read = Instant::now();
+            }
+            Ok(WorkerCommand::Exit) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 }
@@ -256,7 +331,7 @@ where
 fn handle_connection<F>(
     conn: receiver::ConnectionNotification,
     long: &mut HidDevice,
-    pid: u16,
+    receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     profiles: &mut DeviceProfiles,
     known: &mut BTreeSet<u8>,
@@ -264,12 +339,17 @@ fn handle_connection<F>(
 ) where
     F: Fn(DeviceEvent),
 {
+    let pid = receiver.pid;
     let slot = conn.device_index;
     if !(1..=MAX_SLOT).contains(&slot) {
         return;
     }
     if conn.link_established {
-        match read_device(long, slot, pid, conn.wpid, cache, profiles) {
+        let key = device_key(receiver, slot);
+        if invalidate_changed_device(cache, &key, conn.wpid) && known.remove(&slot) {
+            emit(DeviceEvent::Gone(key));
+        }
+        match read_device(long, slot, receiver, conn.wpid, cache, profiles) {
             Ok(Some(state)) => {
                 let newly = known.insert(slot);
                 if newly {
@@ -284,24 +364,34 @@ fn handle_connection<F>(
             Ok(None) => {} // device with no battery feature — ignore
             Err(err) => tracing::warn!("receiver {pid:04X} index {slot}: {err}"),
         }
-    } else if known.remove(&slot) {
-        tracing::info!("device disconnected: {pid:04X} index {slot}");
-        emit(DeviceEvent::Gone(device_key(pid, slot)));
+    } else {
+        if forget_slot(receiver, slot, cache, known) {
+            tracing::info!("device disconnected: {pid:04X} index {slot}");
+            emit(DeviceEvent::Gone(device_key(receiver, slot)));
+        }
     }
 }
 
 /// Re-read battery for every currently-known device (safety timer / refresh).
 fn reread_known<F>(
     long: &mut HidDevice,
-    pid: u16,
+    receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     known: &BTreeSet<u8>,
     emit: &F,
 ) where
     F: Fn(DeviceEvent),
 {
+    let pid = receiver.pid;
     for &slot in known {
-        match read_device(long, slot, pid, 0, cache, &mut DeviceProfiles::default()) {
+        match read_device(
+            long,
+            slot,
+            receiver,
+            0,
+            cache,
+            &mut DeviceProfiles::default(),
+        ) {
             Ok(Some(state)) => emit(DeviceEvent::Update(state)),
             Ok(None) => {}
             Err(err) => tracing::debug!("receiver {pid:04X} index {slot} re-read: {err}"),
@@ -316,7 +406,7 @@ fn reread_known<F>(
 /// reports are queued.
 fn drain_long_events<F>(
     long: &mut HidDevice,
-    pid: u16,
+    receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     profiles: &mut DeviceProfiles,
     known: &BTreeSet<u8>,
@@ -324,7 +414,8 @@ fn drain_long_events<F>(
 ) where
     F: Fn(DeviceEvent),
 {
-    loop {
+    let pid = receiver.pid;
+    for _ in 0..32 {
         let mut buf = [0u8; 21];
         // Timeout 0 = non-blocking: return immediately if nothing is queued.
         match long.read_timeout(&mut buf, 0) {
@@ -334,7 +425,7 @@ fn drain_long_events<F>(
                 };
                 if let ReportClass::FeatureEvent { device_index, .. } = classify(&report) {
                     if known.contains(&device_index) {
-                        match read_device(long, device_index, pid, 0, cache, profiles) {
+                        match read_device(long, device_index, receiver, 0, cache, profiles) {
                             Ok(Some(state)) => {
                                 tracing::info!(
                                     "battery event: {} — {}%{}",
@@ -364,7 +455,7 @@ fn drain_long_events<F>(
 /// slots with the short ping budget and read whatever answers.
 fn discover_by_ping<F>(
     long: &mut HidDevice,
-    pid: u16,
+    receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     profiles: &mut DeviceProfiles,
     known: &mut BTreeSet<u8>,
@@ -372,11 +463,15 @@ fn discover_by_ping<F>(
 ) where
     F: Fn(DeviceEvent),
 {
+    let pid = receiver.pid;
     for slot in 1..=MAX_SLOT {
         if !ping_slot(long, slot) {
+            if forget_slot(receiver, slot, cache, known) {
+                emit(DeviceEvent::Gone(device_key(receiver, slot)));
+            }
             continue;
         }
-        match read_device(long, slot, pid, 0, cache, profiles) {
+        match read_device(long, slot, receiver, 0, cache, profiles) {
             Ok(Some(state)) => {
                 known.insert(slot);
                 emit(DeviceEvent::Update(state));
@@ -397,6 +492,29 @@ fn ping_slot(dev: &mut HidDevice, slot: u8) -> bool {
     )
 }
 
+fn forget_slot(
+    receiver: &ReceiverPath,
+    slot: u8,
+    cache: &mut FeatureCache,
+    known: &mut BTreeSet<u8>,
+) -> bool {
+    cache.devices.remove(&device_key(receiver, slot));
+    known.remove(&slot)
+}
+
+fn invalidate_changed_device(cache: &mut FeatureCache, key: &str, wpid: u16) -> bool {
+    if wpid != 0
+        && cache
+            .devices
+            .get(key)
+            .is_some_and(|entry| entry.wpid != wpid)
+    {
+        cache.devices.remove(key);
+        return true;
+    }
+    false
+}
+
 /// Read one device's battery, enumerating features (once) if needed. Prefers a
 /// persisted [`DeviceProfile`] (keyed by WPID) to skip the fragile multi-round-
 /// trip enumeration on a freshly-woken device; falls back to live enumeration
@@ -404,13 +522,14 @@ fn ping_slot(dev: &mut HidDevice, slot: u8) -> bool {
 fn read_device(
     dev: &mut HidDevice,
     slot: u8,
-    pid: u16,
+    receiver: &ReceiverPath,
     wpid: u16,
     cache: &mut FeatureCache,
     profiles: &mut DeviceProfiles,
 ) -> Result<Option<BatteryState>> {
-    let key = device_key(pid, slot);
+    let key = device_key(receiver, slot);
 
+    invalidate_changed_device(cache, &key, wpid);
     if !cache.devices.contains_key(&key) {
         let entry = resolve_device(dev, slot, wpid, profiles)?;
         cache.devices.insert(key.clone(), entry);
@@ -426,7 +545,7 @@ fn read_device(
     Ok(Some(BatteryState {
         device_key: key,
         display_name,
-        pid,
+        pid: receiver.pid,
         device_index: slot,
         battery_percent,
         is_charging,
@@ -451,6 +570,7 @@ fn resolve_device(
                 return Ok(DeviceCache {
                     battery: Some((id, idx)),
                     display_name: profile.name.clone(),
+                    wpid,
                 });
             }
             tracing::info!("WPID {wpid:04X} cached feature stale — re-enumerating");
@@ -492,6 +612,7 @@ fn resolve_device(
     Ok(DeviceCache {
         battery,
         display_name,
+        wpid,
     })
 }
 
@@ -524,14 +645,7 @@ pub fn poll_once() -> PollResult {
         };
         let mut cache = FeatureCache::new();
         for (slot, wpid) in discover_present_slots(&api, &receiver, &mut long) {
-            match read_device(
-                &mut long,
-                slot,
-                receiver.pid,
-                wpid,
-                &mut cache,
-                &mut profiles,
-            ) {
+            match read_device(&mut long, slot, &receiver, wpid, &mut cache, &mut profiles) {
                 Ok(Some(state)) => result.devices.push(state),
                 Ok(None) => {}
                 Err(err) => result
@@ -554,6 +668,9 @@ fn discover_present_slots(
     receiver: &ReceiverPath,
     long: &mut HidDevice,
 ) -> Vec<(u8, u16)> {
+    if is_direct_device(long) {
+        return vec![(DIRECT_DEVICE_INDEX, 0)];
+    }
     if let Ok(short) = open_notifier(api, receiver) {
         let _ = receiver::enable_notifications(&short);
         // How many devices to expect, so we can stop listening as soon as they've
@@ -731,46 +848,133 @@ fn send_recv_with(
     timeout_ms: i32,
     retries: usize,
 ) -> Result<[u8; 7]> {
-    // Send requests as HID++ long reports (0x11). Wireless devices reply on the
-    // long channel; a short request gets no reply on the long interface handle.
     let request = msg.encode_long();
-
     for attempt in 0..retries {
         dev.write(&request).context("HID write failed")?;
-
-        // Read responses until we get one that matches our request or time out.
-        loop {
-            let mut buf = [0u8; 21]; // 20-byte long report (+1 if report-id prepended)
-            let n = dev
-                .read_timeout(&mut buf, timeout_ms)
-                .context("HID read failed")?;
-
-            if n == 0 {
-                // Timeout — retry the whole request.
-                if attempt + 1 < retries {
-                    thread::sleep(RETRY_DELAY);
-                }
-                break;
-            }
-
-            let Some(response) = normalize_report(&buf, n) else {
-                continue;
-            };
-
-            if ShortMsg::is_error(&response) {
-                bail!("HID++ error response for feature 0x{:02X}", request[2]);
-            }
-
-            // Match on feature_index and SW_ID.
-            if response[2] == request[2] && ShortMsg::sw_id(&response) == SW_ID {
-                return Ok(response);
-            }
-            // Else: discard notification and keep reading.
+        let response = wait_for_response(
+            msg,
+            Duration::from_millis(timeout_ms.max(1) as u64),
+            |remaining| {
+                let mut buf = [0u8; 21];
+                let n = dev
+                    .read_timeout(&mut buf, remaining)
+                    .context("HID read failed")?;
+                Ok((n != 0).then(|| normalize_report(&buf, n)).flatten())
+            },
+        )?;
+        if let Some(response) = response {
+            return Ok(response);
+        }
+        if attempt + 1 < retries {
+            thread::sleep(RETRY_DELAY);
         }
     }
-
     bail!(
         "no response after {retries} attempts for feature 0x{:02X}",
         request[2]
     )
+}
+
+fn matches_reply(msg: ShortMsg, response: &[u8; 7]) -> bool {
+    response[1] == msg.device_index
+        && response[2] == msg.feature_index
+        && response[3] == ((msg.function_id << 4) | SW_ID)
+}
+
+fn matches_error(msg: ShortMsg, response: &[u8; 7]) -> bool {
+    ShortMsg::is_error(response)
+        && response[1] == msg.device_index
+        && response[3] == msg.feature_index
+        && response[4] == ((msg.function_id << 4) | SW_ID)
+}
+
+fn wait_for_response(
+    msg: ShortMsg,
+    timeout: Duration,
+    mut read: impl FnMut(i32) -> Result<Option<[u8; 7]>>,
+) -> Result<Option<[u8; 7]>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let milliseconds = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+        let Some(response) = read(milliseconds)? else {
+            continue;
+        };
+        if matches_error(msg, &response) {
+            bail!(
+                "HID++ error response for feature 0x{:02X}",
+                msg.feature_index
+            );
+        }
+        if matches_reply(msg, &response) {
+            return Ok(Some(response));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn disappearance_clears_only_the_departing_slot_and_its_cache() {
+        let receiver = ReceiverPath {
+            pid: 0xC547,
+            key: "receiver-a".into(),
+            long_path: std::ffi::CString::new("path").unwrap(),
+            short_path: None,
+        };
+        let mut cache = FeatureCache::new();
+        for slot in [1, 2] {
+            cache.devices.insert(
+                device_key(&receiver, slot),
+                DeviceCache {
+                    battery: Some((0x1000, 5)),
+                    display_name: "old".into(),
+                    wpid: 10,
+                },
+            );
+        }
+        let mut known = BTreeSet::from([1, 2]);
+        assert!(forget_slot(&receiver, 1, &mut cache, &mut known));
+        assert!(!forget_slot(&receiver, 1, &mut cache, &mut known));
+        assert_eq!(known, BTreeSet::from([2]));
+        assert_eq!(cache.devices.len(), 1);
+        let key = device_key(&receiver, 2);
+        invalidate_changed_device(&mut cache, &key, 10);
+        assert!(cache.devices.contains_key(&key));
+        invalidate_changed_device(&mut cache, &key, 11);
+        assert!(!cache.devices.contains_key(&key));
+    }
+    #[test]
+    fn direct_usb_detection_requires_device_address_protocol_and_echo() {
+        assert!(direct_ping_reply(&[0x11, 0xFF, 0, 0x1A, 4, 2, 0x55], 0x55));
+        assert!(!direct_ping_reply(&[0x11, 1, 0, 0x1A, 4, 2, 0x55], 0x55));
+        assert!(!direct_ping_reply(&[0x11, 0xFF, 0, 0x1A, 1, 0, 0x55], 0x55));
+        assert!(!direct_ping_reply(&[0x11, 0xFF, 0, 0x1A, 4, 2, 0x56], 0x55));
+    }
+    #[test]
+    fn replies_must_match_device_and_function() {
+        let msg = ShortMsg::new(1, 5, 1, [0; 3]);
+        let reply = [0x11, 1, 5, 0x1A, 42, 0, 0];
+        assert!(matches_reply(msg, &reply));
+        assert!(!matches_reply(ShortMsg::new(2, 5, 1, [0; 3]), &reply));
+        assert!(!matches_reply(ShortMsg::new(1, 5, 0, [0; 3]), &reply));
+        assert!(matches_error(msg, &[0x11, 1, 0xFF, 5, 0x1A, 2, 0]));
+        assert!(!matches_error(msg, &[0x11, 2, 0xFF, 5, 0x1A, 2, 0]));
+    }
+    #[test]
+    fn continuous_unrelated_reports_cannot_extend_deadline() {
+        let start = Instant::now();
+        let result = wait_for_response(
+            ShortMsg::new(1, 5, 1, [0; 3]),
+            Duration::from_millis(20),
+            |_| Ok(Some([0x11, 2, 5, 0x1A, 0, 0, 0])),
+        )
+        .unwrap();
+        assert!(result.is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
 }
