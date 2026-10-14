@@ -21,3 +21,6 @@ ureq = { version = "3.4", default-features = false, features = ["native-tls", "w
 [target.'cfg(windows)'.dependencies]
 tauri-winrt-notification = "0.8"
 winreg = "0.56"
+
+[build-dependencies]
+winresource = "0.1.34"

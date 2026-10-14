@@ -124,7 +124,7 @@ cargo run -- --once            # print battery level to stdout
 cargo run -- --diag            # dump HID++ interfaces, ping results + notification probe (hardware debugging)
 ```
 
-The release binary and CI build with the **MSVC** toolchain (`x86_64-pc-windows-msvc`), which works out of the box on `windows-latest`. To build locally with the **GNU** toolchain instead, you also need a full MinGW-w64 on `PATH` (the `windows` crates invoke `dlltool`/`as`, which rustup's bundled MinGW does not fully provide).
+The release binary and CI build with the **MSVC** toolchain (`x86_64-pc-windows-msvc`), which works out of the box on `windows-latest`. To build locally with the **GNU** toolchain instead, you also need a full MinGW-w64 on `PATH` (the `windows` crates invoke `dlltool`/`as`, and `build.rs` uses `windres` to embed the exe's version info, which rustup's bundled MinGW does not fully provide).
 
 CI lives in [`.github/workflows`](.github/workflows): `pr-build` tests and builds on every push/PR, and `release-on-tag` cuts a GitHub release with the exe and a SHA256 checksum when you push a `v*.*.*` tag.
 
