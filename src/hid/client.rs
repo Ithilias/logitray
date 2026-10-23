@@ -139,10 +139,10 @@ where
     // both collections from the thread that uses them.
     let api = HidApi::new().context("failed to initialize hidapi")?;
     let mut long = open_receiver(&api, receiver).context("failed to open device interface")?;
-    if is_direct_device(&mut long) {
+    let short = open_notifier(&api, receiver).ok();
+    if detect_direct_usb(&mut long, short.as_ref()) {
         return run_direct_worker(&mut long, receiver, safety_secs, cmd_rx, emit);
     }
-    let short = open_notifier(&api, receiver).ok();
     if short.is_none() {
         tracing::info!(
             "receiver {:04X}: no short collection — using ping discovery + safety poll",
@@ -159,7 +159,7 @@ where
     // announce its connected devices — the resulting 0x41 reports drive the read
     // loop below. Without, probe slots directly.
     if let Some(short) = &short {
-        let _ = receiver::enable_notifications(short);
+        // Notification setup was already attempted during transport detection.
         let _ = receiver::poke_announce(short);
     } else {
         discover_by_ping(
@@ -254,6 +254,29 @@ where
             last_safety = Instant::now();
         }
     }
+}
+
+/// Use normal receiver setup first. A successful register request identifies
+/// a receiver even when no wireless device is connected; do not pay USB ping
+/// timeouts merely because its device list is empty.
+fn detect_direct_usb(long: &mut HidDevice, short: Option<&HidDevice>) -> bool {
+    direct_usb_fallback(
+        || {
+            short.is_some_and(|short| {
+                receiver::enable_notifications(short)
+                    .or_else(|_| receiver::connected_count(short).map(|_| ()))
+                    .is_ok()
+            })
+        },
+        || is_direct_device(long),
+    )
+}
+
+fn direct_usb_fallback(
+    receiver_setup: impl FnOnce() -> bool,
+    usb_probe: impl FnOnce() -> bool,
+) -> bool {
+    !receiver_setup() && usb_probe()
 }
 
 // A receiver speaks HID++ 1.0 at 0xFF; a wired device answers the HID++ 2.0
@@ -701,11 +724,11 @@ fn discover_present_slots(
     receiver: &ReceiverPath,
     long: &mut HidDevice,
 ) -> Vec<(u8, u16)> {
-    if is_direct_device(long) {
+    let short = open_notifier(api, receiver).ok();
+    if detect_direct_usb(long, short.as_ref()) {
         return vec![(DIRECT_DEVICE_INDEX, 0)];
     }
-    if let Ok(short) = open_notifier(api, receiver) {
-        let _ = receiver::enable_notifications(&short);
+    if let Some(short) = short {
         // How many devices to expect, so we can stop listening as soon as they've
         // all announced rather than always waiting out the deadline.
         let expected = receiver::connected_count(&short).unwrap_or(0) as usize;
@@ -1049,6 +1072,32 @@ mod tests {
         assert!(record_ping_result(
             &receiver, 1, false, &mut cache, &mut known
         ));
+    }
+
+    #[test]
+    fn working_receiver_skips_usb_probe_even_with_zero_devices() {
+        let connected_count = Ok::<u8, ()>(0);
+        assert!(!direct_usb_fallback(
+            || connected_count.is_ok(),
+            || panic!("a responding receiver must not run the USB probe"),
+        ));
+    }
+
+    #[test]
+    fn usb_probe_runs_only_after_receiver_setup_fails() {
+        use std::cell::Cell;
+        let receiver_attempted = Cell::new(false);
+        assert!(direct_usb_fallback(
+            || {
+                receiver_attempted.set(true);
+                false
+            },
+            || {
+                assert!(receiver_attempted.get());
+                true
+            },
+        ));
+        assert!(!direct_usb_fallback(|| false, || false));
     }
 
     #[test]
