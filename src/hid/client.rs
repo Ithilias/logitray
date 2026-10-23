@@ -52,9 +52,10 @@ const MAX_SLOT: u8 = 6;
 struct DeviceCache {
     battery: Option<(u16, u8)>,
     display_name: String,
+    wpid: u16,
 }
 
-/// Cache of [`DeviceCache`] keyed by `device_key` ("PID:index"), held for the
+/// Cache of [`DeviceCache`] keyed by `device_key` ("receiver-path:index"), held for the
 /// worker's lifetime.
 #[derive(Default)]
 pub struct FeatureCache {
@@ -80,7 +81,7 @@ pub enum DeviceEvent {
     /// an unplugged receiver cannot send one: the worker either dies mid-read or
     /// (with no short collection) never notices at all. Without this the tray
     /// keeps every device the receiver was carrying.
-    ReceiverGone(u16),
+    ReceiverGone(String),
 }
 
 /// Commands the tray sends to a receiver worker.
@@ -94,8 +95,8 @@ pub enum WorkerCommand {
     Exit,
 }
 
-fn device_key(pid: u16, slot: u8) -> String {
-    format!("{pid:04X}:{slot}")
+fn device_key(receiver: &ReceiverPath, slot: u8) -> String {
+    format!("{}:{slot}", receiver.key)
 }
 
 /// Spawn the worker thread for one receiver. `emit` is invoked (from the worker
@@ -152,7 +153,7 @@ where
     } else {
         discover_by_ping(
             &mut long,
-            receiver.pid,
+            receiver,
             &mut cache,
             &mut profiles,
             &mut known,
@@ -174,7 +175,7 @@ where
                             handle_connection(
                                 conn,
                                 &mut long,
-                                receiver.pid,
+                                receiver,
                                 &mut cache,
                                 &mut profiles,
                                 &mut known,
@@ -193,14 +194,7 @@ where
         // Drain any unsolicited HID++ 2.0 battery events the device pushed on the
         // long interface (e.g. charging started/stopped) and reflect them right
         // away rather than waiting for the safety re-read.
-        drain_long_events(
-            &mut long,
-            receiver.pid,
-            &mut cache,
-            &mut profiles,
-            &known,
-            emit,
-        );
+        drain_long_events(&mut long, receiver, &mut cache, &mut profiles, &known, emit);
 
         // Drain pending commands.
         loop {
@@ -211,14 +205,14 @@ where
                     } else {
                         discover_by_ping(
                             &mut long,
-                            receiver.pid,
+                            receiver,
                             &mut cache,
                             &mut profiles,
                             &mut known,
                             emit,
                         );
                     }
-                    reread_known(&mut long, receiver.pid, &mut cache, &known, emit);
+                    reread_known(&mut long, receiver, &mut cache, &known, emit);
                 }
                 Ok(WorkerCommand::SetSafetyInterval(secs)) => {
                     safety = Duration::from_secs(secs.max(MIN_SAFETY_SECS));
@@ -238,14 +232,14 @@ where
             } else {
                 discover_by_ping(
                     &mut long,
-                    receiver.pid,
+                    receiver,
                     &mut cache,
                     &mut profiles,
                     &mut known,
                     emit,
                 );
             }
-            reread_known(&mut long, receiver.pid, &mut cache, &known, emit);
+            reread_known(&mut long, receiver, &mut cache, &known, emit);
             last_safety = Instant::now();
         }
     }
@@ -256,7 +250,7 @@ where
 fn handle_connection<F>(
     conn: receiver::ConnectionNotification,
     long: &mut HidDevice,
-    pid: u16,
+    receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     profiles: &mut DeviceProfiles,
     known: &mut BTreeSet<u8>,
@@ -264,12 +258,17 @@ fn handle_connection<F>(
 ) where
     F: Fn(DeviceEvent),
 {
+    let pid = receiver.pid;
     let slot = conn.device_index;
     if !(1..=MAX_SLOT).contains(&slot) {
         return;
     }
     if conn.link_established {
-        match read_device(long, slot, pid, conn.wpid, cache, profiles) {
+        let key = device_key(receiver, slot);
+        if invalidate_changed_device(cache, &key, conn.wpid) && known.remove(&slot) {
+            emit(DeviceEvent::Gone(key));
+        }
+        match read_device(long, slot, receiver, conn.wpid, cache, profiles) {
             Ok(Some(state)) => {
                 let newly = known.insert(slot);
                 if newly {
@@ -284,24 +283,34 @@ fn handle_connection<F>(
             Ok(None) => {} // device with no battery feature — ignore
             Err(err) => tracing::warn!("receiver {pid:04X} index {slot}: {err}"),
         }
-    } else if known.remove(&slot) {
-        tracing::info!("device disconnected: {pid:04X} index {slot}");
-        emit(DeviceEvent::Gone(device_key(pid, slot)));
+    } else {
+        if forget_slot(receiver, slot, cache, known) {
+            tracing::info!("device disconnected: {pid:04X} index {slot}");
+            emit(DeviceEvent::Gone(device_key(receiver, slot)));
+        }
     }
 }
 
 /// Re-read battery for every currently-known device (safety timer / refresh).
 fn reread_known<F>(
     long: &mut HidDevice,
-    pid: u16,
+    receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     known: &BTreeSet<u8>,
     emit: &F,
 ) where
     F: Fn(DeviceEvent),
 {
+    let pid = receiver.pid;
     for &slot in known {
-        match read_device(long, slot, pid, 0, cache, &mut DeviceProfiles::default()) {
+        match read_device(
+            long,
+            slot,
+            receiver,
+            0,
+            cache,
+            &mut DeviceProfiles::default(),
+        ) {
             Ok(Some(state)) => emit(DeviceEvent::Update(state)),
             Ok(None) => {}
             Err(err) => tracing::debug!("receiver {pid:04X} index {slot} re-read: {err}"),
@@ -316,7 +325,7 @@ fn reread_known<F>(
 /// reports are queued.
 fn drain_long_events<F>(
     long: &mut HidDevice,
-    pid: u16,
+    receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     profiles: &mut DeviceProfiles,
     known: &BTreeSet<u8>,
@@ -324,6 +333,7 @@ fn drain_long_events<F>(
 ) where
     F: Fn(DeviceEvent),
 {
+    let pid = receiver.pid;
     for _ in 0..32 {
         let mut buf = [0u8; 21];
         // Timeout 0 = non-blocking: return immediately if nothing is queued.
@@ -334,7 +344,7 @@ fn drain_long_events<F>(
                 };
                 if let ReportClass::FeatureEvent { device_index, .. } = classify(&report) {
                     if known.contains(&device_index) {
-                        match read_device(long, device_index, pid, 0, cache, profiles) {
+                        match read_device(long, device_index, receiver, 0, cache, profiles) {
                             Ok(Some(state)) => {
                                 tracing::info!(
                                     "battery event: {} — {}%{}",
@@ -364,7 +374,7 @@ fn drain_long_events<F>(
 /// slots with the short ping budget and read whatever answers.
 fn discover_by_ping<F>(
     long: &mut HidDevice,
-    pid: u16,
+    receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     profiles: &mut DeviceProfiles,
     known: &mut BTreeSet<u8>,
@@ -372,11 +382,15 @@ fn discover_by_ping<F>(
 ) where
     F: Fn(DeviceEvent),
 {
+    let pid = receiver.pid;
     for slot in 1..=MAX_SLOT {
         if !ping_slot(long, slot) {
+            if forget_slot(receiver, slot, cache, known) {
+                emit(DeviceEvent::Gone(device_key(receiver, slot)));
+            }
             continue;
         }
-        match read_device(long, slot, pid, 0, cache, profiles) {
+        match read_device(long, slot, receiver, 0, cache, profiles) {
             Ok(Some(state)) => {
                 known.insert(slot);
                 emit(DeviceEvent::Update(state));
@@ -397,6 +411,29 @@ fn ping_slot(dev: &mut HidDevice, slot: u8) -> bool {
     )
 }
 
+fn forget_slot(
+    receiver: &ReceiverPath,
+    slot: u8,
+    cache: &mut FeatureCache,
+    known: &mut BTreeSet<u8>,
+) -> bool {
+    cache.devices.remove(&device_key(receiver, slot));
+    known.remove(&slot)
+}
+
+fn invalidate_changed_device(cache: &mut FeatureCache, key: &str, wpid: u16) -> bool {
+    if wpid != 0
+        && cache
+            .devices
+            .get(key)
+            .is_some_and(|entry| entry.wpid != wpid)
+    {
+        cache.devices.remove(key);
+        return true;
+    }
+    false
+}
+
 /// Read one device's battery, enumerating features (once) if needed. Prefers a
 /// persisted [`DeviceProfile`] (keyed by WPID) to skip the fragile multi-round-
 /// trip enumeration on a freshly-woken device; falls back to live enumeration
@@ -404,13 +441,14 @@ fn ping_slot(dev: &mut HidDevice, slot: u8) -> bool {
 fn read_device(
     dev: &mut HidDevice,
     slot: u8,
-    pid: u16,
+    receiver: &ReceiverPath,
     wpid: u16,
     cache: &mut FeatureCache,
     profiles: &mut DeviceProfiles,
 ) -> Result<Option<BatteryState>> {
-    let key = device_key(pid, slot);
+    let key = device_key(receiver, slot);
 
+    invalidate_changed_device(cache, &key, wpid);
     if !cache.devices.contains_key(&key) {
         let entry = resolve_device(dev, slot, wpid, profiles)?;
         cache.devices.insert(key.clone(), entry);
@@ -426,7 +464,7 @@ fn read_device(
     Ok(Some(BatteryState {
         device_key: key,
         display_name,
-        pid,
+        pid: receiver.pid,
         device_index: slot,
         battery_percent,
         is_charging,
@@ -451,6 +489,7 @@ fn resolve_device(
                 return Ok(DeviceCache {
                     battery: Some((id, idx)),
                     display_name: profile.name.clone(),
+                    wpid,
                 });
             }
             tracing::info!("WPID {wpid:04X} cached feature stale — re-enumerating");
@@ -492,6 +531,7 @@ fn resolve_device(
     Ok(DeviceCache {
         battery,
         display_name,
+        wpid,
     })
 }
 
@@ -524,14 +564,7 @@ pub fn poll_once() -> PollResult {
         };
         let mut cache = FeatureCache::new();
         for (slot, wpid) in discover_present_slots(&api, &receiver, &mut long) {
-            match read_device(
-                &mut long,
-                slot,
-                receiver.pid,
-                wpid,
-                &mut cache,
-                &mut profiles,
-            ) {
+            match read_device(&mut long, slot, &receiver, wpid, &mut cache, &mut profiles) {
                 Ok(Some(state)) => result.devices.push(state),
                 Ok(None) => {}
                 Err(err) => result
@@ -801,6 +834,36 @@ fn wait_for_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn disappearance_clears_only_the_departing_slot_and_its_cache() {
+        let receiver = ReceiverPath {
+            pid: 0xC547,
+            key: "receiver-a".into(),
+            long_path: std::ffi::CString::new("path").unwrap(),
+            short_path: None,
+        };
+        let mut cache = FeatureCache::new();
+        for slot in [1, 2] {
+            cache.devices.insert(
+                device_key(&receiver, slot),
+                DeviceCache {
+                    battery: Some((0x1000, 5)),
+                    display_name: "old".into(),
+                    wpid: 10,
+                },
+            );
+        }
+        let mut known = BTreeSet::from([1, 2]);
+        assert!(forget_slot(&receiver, 1, &mut cache, &mut known));
+        assert!(!forget_slot(&receiver, 1, &mut cache, &mut known));
+        assert_eq!(known, BTreeSet::from([2]));
+        assert_eq!(cache.devices.len(), 1);
+        let key = device_key(&receiver, 2);
+        invalidate_changed_device(&mut cache, &key, 10);
+        assert!(cache.devices.contains_key(&key));
+        invalidate_changed_device(&mut cache, &key, 11);
+        assert!(!cache.devices.contains_key(&key));
+    }
     #[test]
     fn replies_must_match_device_and_function() {
         let msg = ShortMsg::new(1, 5, 1, [0; 3]);
