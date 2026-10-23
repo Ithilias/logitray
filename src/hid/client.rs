@@ -49,6 +49,9 @@ const MAX_SLOT: u8 = 6;
 /// consecutive failed discovery cycles before declaring a known device gone.
 const MAX_MISSED_PING_CYCLES: u8 = 3;
 
+/// Direct USB HID++ devices address themselves at 0xFF.
+const DIRECT_DEVICE_INDEX: u8 = 0xFF;
+
 /// Per-device data that never changes while a device stays paired: which battery
 /// feature to use (and its table index) and the display name. Enumeration is
 /// many HID++ round-trips, so we do it once and reuse it. `battery` is `None`
@@ -136,6 +139,9 @@ where
     // both collections from the thread that uses them.
     let api = HidApi::new().context("failed to initialize hidapi")?;
     let mut long = open_receiver(&api, receiver).context("failed to open device interface")?;
+    if is_direct_device(&mut long) {
+        return run_direct_worker(&mut long, receiver, safety_secs, cmd_rx, emit);
+    }
     let short = open_notifier(&api, receiver).ok();
     if short.is_none() {
         tracing::info!(
@@ -246,6 +252,81 @@ where
             }
             reread_known(&mut long, receiver, &mut cache, &known, emit);
             last_safety = Instant::now();
+        }
+    }
+}
+
+// A receiver speaks HID++ 1.0 at 0xFF; a wired device answers the HID++ 2.0
+// root ping there. Verify both the protocol version and echo, rather than
+// inferring connection type from a product name or a guessed PID range.
+fn is_direct_device(long: &mut HidDevice) -> bool {
+    let echo = 0x55;
+    send_recv_with(
+        long,
+        ping(DIRECT_DEVICE_INDEX, echo),
+        PING_TIMEOUT_MS,
+        PING_RETRIES,
+    )
+    .is_ok_and(|reply| direct_ping_reply(&reply, echo))
+}
+
+fn direct_ping_reply(reply: &[u8; 7], echo: u8) -> bool {
+    reply[1] == DIRECT_DEVICE_INDEX && reply[4] >= 2 && reply[6] == echo
+}
+
+fn run_direct_worker<F>(
+    long: &mut HidDevice,
+    receiver: &ReceiverPath,
+    safety_secs: u64,
+    cmd_rx: &mpsc::Receiver<WorkerCommand>,
+    emit: &F,
+) -> Result<()>
+where
+    F: Fn(DeviceEvent),
+{
+    let mut cache = FeatureCache::new();
+    let mut profiles = config::load_device_profiles();
+    let mut known = BTreeSet::new();
+    let mut safety = Duration::from_secs(safety_secs.max(MIN_SAFETY_SECS));
+    let mut next_read = Instant::now();
+    loop {
+        if Instant::now() >= next_read {
+            match read_device(
+                long,
+                DIRECT_DEVICE_INDEX,
+                receiver,
+                0,
+                &mut cache,
+                &mut profiles,
+            ) {
+                Ok(Some(state)) => {
+                    known.insert(DIRECT_DEVICE_INDEX);
+                    emit(DeviceEvent::Update(state));
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::debug!("USB device {:04X} battery read: {err}", receiver.pid);
+                    if forget_slot(receiver, DIRECT_DEVICE_INDEX, &mut cache, &mut known) {
+                        emit(DeviceEvent::Gone(device_key(receiver, DIRECT_DEVICE_INDEX)));
+                    }
+                }
+            }
+            next_read = Instant::now() + safety;
+        }
+        // Direct devices have no receiver connection announcements. Their
+        // battery events arrive on the long interface and use index 0xFF.
+        drain_long_events(long, receiver, &mut cache, &mut profiles, &known, emit);
+        let wait = next_read
+            .saturating_duration_since(Instant::now())
+            .min(Duration::from_secs(1));
+        match cmd_rx.recv_timeout(wait) {
+            Ok(WorkerCommand::Refresh) => next_read = Instant::now(),
+            Ok(WorkerCommand::SetSafetyInterval(secs)) => {
+                safety = Duration::from_secs(secs.max(MIN_SAFETY_SECS));
+                next_read = Instant::now();
+            }
+            Ok(WorkerCommand::Exit) | Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
 }
@@ -620,6 +701,9 @@ fn discover_present_slots(
     receiver: &ReceiverPath,
     long: &mut HidDevice,
 ) -> Vec<(u8, u16)> {
+    if is_direct_device(long) {
+        return vec![(DIRECT_DEVICE_INDEX, 0)];
+    }
     if let Ok(short) = open_notifier(api, receiver) {
         let _ = receiver::enable_notifications(&short);
         // How many devices to expect, so we can stop listening as soon as they've
@@ -967,6 +1051,13 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn direct_usb_detection_requires_device_address_protocol_and_echo() {
+        assert!(direct_ping_reply(&[0x11, 0xFF, 0, 0x1A, 4, 2, 0x55], 0x55));
+        assert!(!direct_ping_reply(&[0x11, 1, 0, 0x1A, 4, 2, 0x55], 0x55));
+        assert!(!direct_ping_reply(&[0x11, 0xFF, 0, 0x1A, 1, 0, 0x55], 0x55));
+        assert!(!direct_ping_reply(&[0x11, 0xFF, 0, 0x1A, 4, 2, 0x56], 0x55));
+    }
     #[test]
     fn replies_must_match_device_and_function() {
         let msg = ShortMsg::new(1, 5, 1, [0; 3]);
