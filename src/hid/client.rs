@@ -45,6 +45,10 @@ const MIN_SAFETY_SECS: u64 = 15;
 /// Highest device slot a receiver can pair (Unifying supports 6).
 const MAX_SLOT: u8 = 6;
 
+/// Idle devices may miss a complete ping retry budget while waking up. Require
+/// consecutive failed discovery cycles before declaring a known device gone.
+const MAX_MISSED_PING_CYCLES: u8 = 3;
+
 /// Per-device data that never changes while a device stays paired: which battery
 /// feature to use (and its table index) and the display name. Enumeration is
 /// many HID++ round-trips, so we do it once and reuse it. `battery` is `None`
@@ -60,6 +64,7 @@ struct DeviceCache {
 #[derive(Default)]
 pub struct FeatureCache {
     devices: HashMap<String, DeviceCache>,
+    missed_ping_cycles: HashMap<String, u8>,
 }
 
 impl FeatureCache {
@@ -384,10 +389,11 @@ fn discover_by_ping<F>(
 {
     let pid = receiver.pid;
     for slot in 1..=MAX_SLOT {
-        if !ping_slot(long, slot) {
-            if forget_slot(receiver, slot, cache, known) {
-                emit(DeviceEvent::Gone(device_key(receiver, slot)));
-            }
+        let responded = ping_slot(long, slot);
+        if record_ping_result(receiver, slot, responded, cache, known) {
+            emit(DeviceEvent::Gone(device_key(receiver, slot)));
+        }
+        if !responded {
             continue;
         }
         match read_device(long, slot, receiver, 0, cache, profiles) {
@@ -411,13 +417,40 @@ fn ping_slot(dev: &mut HidDevice, slot: u8) -> bool {
     )
 }
 
+/// Return true only on the cycle that removes an unresponsive known device.
+/// A successful ping resets misses even if the subsequent battery read fails.
+fn record_ping_result(
+    receiver: &ReceiverPath,
+    slot: u8,
+    responded: bool,
+    cache: &mut FeatureCache,
+    known: &mut BTreeSet<u8>,
+) -> bool {
+    let key = device_key(receiver, slot);
+    if responded {
+        cache.missed_ping_cycles.remove(&key);
+        return false;
+    }
+    if !known.contains(&slot) {
+        return false;
+    }
+    let misses = cache.missed_ping_cycles.entry(key).or_default();
+    *misses = misses.saturating_add(1);
+    if *misses >= MAX_MISSED_PING_CYCLES {
+        return forget_slot(receiver, slot, cache, known);
+    }
+    false
+}
+
 fn forget_slot(
     receiver: &ReceiverPath,
     slot: u8,
     cache: &mut FeatureCache,
     known: &mut BTreeSet<u8>,
 ) -> bool {
-    cache.devices.remove(&device_key(receiver, slot));
+    let key = device_key(receiver, slot);
+    cache.devices.remove(&key);
+    cache.missed_ping_cycles.remove(&key);
     known.remove(&slot)
 }
 
@@ -864,6 +897,76 @@ mod tests {
         invalidate_changed_device(&mut cache, &key, 11);
         assert!(!cache.devices.contains_key(&key));
     }
+    #[test]
+    fn idle_devices_require_three_consecutive_missed_discovery_cycles() {
+        let receiver = ReceiverPath {
+            pid: 0xC547,
+            key: "receiver-a".into(),
+            long_path: std::ffi::CString::new("path").unwrap(),
+            short_path: None,
+        };
+        let mut cache = FeatureCache::new();
+        let key = device_key(&receiver, 1);
+        cache.devices.insert(
+            key.clone(),
+            DeviceCache {
+                battery: Some((0x1000, 5)),
+                display_name: "Mouse".into(),
+                wpid: 10,
+            },
+        );
+        let mut known = BTreeSet::from([1, 2]);
+        for _ in 0..2 {
+            assert!(!record_ping_result(
+                &receiver, 1, false, &mut cache, &mut known
+            ));
+            assert!(known.contains(&1));
+            assert!(cache.devices.contains_key(&key));
+        }
+        // An unrelated slot succeeding must not reset this device's misses.
+        assert!(!record_ping_result(
+            &receiver, 2, true, &mut cache, &mut known
+        ));
+        assert!(record_ping_result(
+            &receiver, 1, false, &mut cache, &mut known
+        ));
+        assert_eq!(known, BTreeSet::from([2]));
+        assert!(!cache.devices.contains_key(&key));
+        assert!(!cache.missed_ping_cycles.contains_key(&key));
+        assert!(!record_ping_result(
+            &receiver, 1, false, &mut cache, &mut known
+        ));
+    }
+
+    #[test]
+    fn successful_ping_and_explicit_departure_reset_missed_cycles() {
+        let receiver = ReceiverPath {
+            pid: 0xC547,
+            key: "receiver-a".into(),
+            long_path: std::ffi::CString::new("path").unwrap(),
+            short_path: None,
+        };
+        let mut cache = FeatureCache::new();
+        let mut known = BTreeSet::from([1]);
+        for responded in [false, false, true, false, false] {
+            assert!(!record_ping_result(
+                &receiver, 1, responded, &mut cache, &mut known
+            ));
+            assert!(known.contains(&1));
+        }
+        // A real disconnect is immediate, and a reconnect starts with no misses.
+        assert!(forget_slot(&receiver, 1, &mut cache, &mut known));
+        known.insert(1);
+        for _ in 0..2 {
+            assert!(!record_ping_result(
+                &receiver, 1, false, &mut cache, &mut known
+            ));
+        }
+        assert!(record_ping_result(
+            &receiver, 1, false, &mut cache, &mut known
+        ));
+    }
+
     #[test]
     fn replies_must_match_device_and_function() {
         let msg = ShortMsg::new(1, 5, 1, [0; 3]);
