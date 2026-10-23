@@ -785,16 +785,36 @@ fn find_selected_device<'a>(
     if let Some(device) = devices.iter().find(|d| d.device_key == selected_id) {
         return Some(device);
     }
-    // Older configs used PID:slot. Honour that choice only when it identifies
-    // exactly one present device; two identical receivers must not pick at random.
-    let (pid, slot) = selected_id.split_once(':')?;
-    let pid = u16::from_str_radix(pid, 16).ok()?;
-    let slot = slot.parse::<u8>().ok()?;
+    // Accept both legacy PID:slot keys and physical-path keys after a USB port
+    // change, but only when PID and slot identify exactly one present device.
+    let (pid, slot) = selected_device_identity(selected_id)?;
     let mut matches = devices
         .iter()
         .filter(|d| d.pid == pid && d.device_index == slot);
     let device = matches.next()?;
     matches.next().is_none().then_some(device)
+}
+
+/// Extract the receiver PID and device slot without depending on USB port identity.
+fn selected_device_identity(key: &str) -> Option<(u16, u8)> {
+    let (receiver, slot) = key.rsplit_once(':')?;
+    let slot = slot.parse::<u8>().ok()?;
+    let receiver = receiver.to_ascii_lowercase();
+    let pid = if receiver.starts_with(r"\\?\hid#") {
+        let hardware_id = receiver.split('#').nth(1)?;
+        if !hardware_id.split('&').any(|part| part == "vid_046d") {
+            return None;
+        }
+        hardware_id
+            .split('&')
+            .find_map(|part| part.strip_prefix("pid_"))?
+    } else {
+        receiver.as_str()
+    };
+    if pid.len() != 4 || !pid.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    Some((u16::from_str_radix(pid, 16).ok()?, slot))
 }
 
 /// The device the icon speaks for: the pinned one, or under
@@ -1319,6 +1339,54 @@ mod tests {
                 .device_key,
             "receiver-b:1"
         );
+    }
+
+    #[test]
+    fn pinned_path_survives_port_changes_only_when_unambiguous() {
+        let saved = r"\\?\hid#vid_046d&pid_c52b&mi_02#old-port#{guid}:1";
+        let moved = r"\\?\hid#vid_046d&pid_c52b&mi_02#new-port#{guid}:1";
+        let other = r"\\?\hid#vid_046d&pid_c52b&mi_02#other-port#{guid}:1";
+        let mut devices = vec![mk(moved)];
+        assert_eq!(
+            find_selected_device(&devices, saved).unwrap().device_key,
+            moved
+        );
+        devices.push(mk(other));
+        assert!(find_selected_device(&devices, saved).is_none());
+        // Exact identity always wins, even if PID and slot are ambiguous.
+        assert_eq!(
+            find_selected_device(&devices, moved).unwrap().device_key,
+            moved
+        );
+        devices[1].device_index = 2;
+        assert_eq!(
+            find_selected_device(&devices, saved).unwrap().device_key,
+            moved
+        );
+        devices[0].pid = 0xC547;
+        assert!(find_selected_device(&devices, saved).is_none());
+    }
+
+    #[test]
+    fn selection_identity_accepts_both_key_formats_and_rejects_malformed_keys() {
+        use super::selected_device_identity;
+        assert_eq!(selected_device_identity("C52B:1"), Some((0xC52B, 1)));
+        assert_eq!(
+            selected_device_identity(r"\\?\HID#VID_046D&PID_C52B&MI_02#port#{guid}:1"),
+            Some((0xC52B, 1))
+        );
+        for invalid in [
+            "lowest",
+            "C52B:x",
+            "C52B:256",
+            "C52:1",
+            "GGGG:1",
+            r"\\?\hid#vid_1234&pid_c52b#port:1",
+            r"\\?\hid#vid_046d&pid_c52bextra#port:1",
+            r"\\?\hid#vid_046d#port-pid_c52b:1",
+        ] {
+            assert_eq!(selected_device_identity(invalid), None, "{invalid}");
+        }
     }
 
     #[test]
