@@ -324,7 +324,7 @@ fn drain_long_events<F>(
 ) where
     F: Fn(DeviceEvent),
 {
-    loop {
+    for _ in 0..32 {
         let mut buf = [0u8; 21];
         // Timeout 0 = non-blocking: return immediately if nothing is queued.
         match long.read_timeout(&mut buf, 0) {
@@ -731,46 +731,96 @@ fn send_recv_with(
     timeout_ms: i32,
     retries: usize,
 ) -> Result<[u8; 7]> {
-    // Send requests as HID++ long reports (0x11). Wireless devices reply on the
-    // long channel; a short request gets no reply on the long interface handle.
     let request = msg.encode_long();
-
     for attempt in 0..retries {
         dev.write(&request).context("HID write failed")?;
-
-        // Read responses until we get one that matches our request or time out.
-        loop {
-            let mut buf = [0u8; 21]; // 20-byte long report (+1 if report-id prepended)
-            let n = dev
-                .read_timeout(&mut buf, timeout_ms)
-                .context("HID read failed")?;
-
-            if n == 0 {
-                // Timeout — retry the whole request.
-                if attempt + 1 < retries {
-                    thread::sleep(RETRY_DELAY);
-                }
-                break;
-            }
-
-            let Some(response) = normalize_report(&buf, n) else {
-                continue;
-            };
-
-            if ShortMsg::is_error(&response) {
-                bail!("HID++ error response for feature 0x{:02X}", request[2]);
-            }
-
-            // Match on feature_index and SW_ID.
-            if response[2] == request[2] && ShortMsg::sw_id(&response) == SW_ID {
-                return Ok(response);
-            }
-            // Else: discard notification and keep reading.
+        let response = wait_for_response(
+            msg,
+            Duration::from_millis(timeout_ms.max(1) as u64),
+            |remaining| {
+                let mut buf = [0u8; 21];
+                let n = dev
+                    .read_timeout(&mut buf, remaining)
+                    .context("HID read failed")?;
+                Ok((n != 0).then(|| normalize_report(&buf, n)).flatten())
+            },
+        )?;
+        if let Some(response) = response {
+            return Ok(response);
+        }
+        if attempt + 1 < retries {
+            thread::sleep(RETRY_DELAY);
         }
     }
-
     bail!(
         "no response after {retries} attempts for feature 0x{:02X}",
         request[2]
     )
+}
+
+fn matches_reply(msg: ShortMsg, response: &[u8; 7]) -> bool {
+    response[1] == msg.device_index
+        && response[2] == msg.feature_index
+        && response[3] == ((msg.function_id << 4) | SW_ID)
+}
+
+fn matches_error(msg: ShortMsg, response: &[u8; 7]) -> bool {
+    ShortMsg::is_error(response)
+        && response[1] == msg.device_index
+        && response[3] == msg.feature_index
+        && response[4] == ((msg.function_id << 4) | SW_ID)
+}
+
+fn wait_for_response(
+    msg: ShortMsg,
+    timeout: Duration,
+    mut read: impl FnMut(i32) -> Result<Option<[u8; 7]>>,
+) -> Result<Option<[u8; 7]>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let milliseconds = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+        let Some(response) = read(milliseconds)? else {
+            continue;
+        };
+        if matches_error(msg, &response) {
+            bail!(
+                "HID++ error response for feature 0x{:02X}",
+                msg.feature_index
+            );
+        }
+        if matches_reply(msg, &response) {
+            return Ok(Some(response));
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn replies_must_match_device_and_function() {
+        let msg = ShortMsg::new(1, 5, 1, [0; 3]);
+        let reply = [0x11, 1, 5, 0x1A, 42, 0, 0];
+        assert!(matches_reply(msg, &reply));
+        assert!(!matches_reply(ShortMsg::new(2, 5, 1, [0; 3]), &reply));
+        assert!(!matches_reply(ShortMsg::new(1, 5, 0, [0; 3]), &reply));
+        assert!(matches_error(msg, &[0x11, 1, 0xFF, 5, 0x1A, 2, 0]));
+        assert!(!matches_error(msg, &[0x11, 2, 0xFF, 5, 0x1A, 2, 0]));
+    }
+    #[test]
+    fn continuous_unrelated_reports_cannot_extend_deadline() {
+        let start = Instant::now();
+        let result = wait_for_response(
+            ShortMsg::new(1, 5, 1, [0; 3]),
+            Duration::from_millis(20),
+            |_| Ok(Some([0x11, 2, 5, 0x1A, 0, 0, 0])),
+        )
+        .unwrap();
+        assert!(result.is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
 }
