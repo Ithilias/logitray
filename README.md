@@ -108,7 +108,7 @@ Logs are written to `%APPDATA%\logitray\logitray.log` (rotated, last few kept).
 ## Limitations
 
 - Windows only.
-- The device must be connected through a Logitech USB receiver — Bluetooth-only connections are not supported.
+- Supports Logitech USB receivers and direct USB-connected HID++ 2.0 devices that expose battery data. Bluetooth-only connections are not supported.
 - Requires an HID++ 2.0 device (essentially all modern Logitech wireless mice/keyboards).
 - For devices reporting voltage (feature `0x1001`), the percentage is an estimate from a voltage curve.
 - Coexists with Logitech G HUB / Options+ if they're installed, but neither is required.
