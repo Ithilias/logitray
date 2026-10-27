@@ -14,9 +14,9 @@
 //! traffic. Byte layouts follow Solaar's `lib/logitech_receiver/hidpp10.py` and
 //! `receiver.py`. Bolt pairing sub-registers differ and are left a marked stub.
 
+use crate::hid::link::HidLink;
 use crate::hid::protocol::{classify, normalize_report, ReportClass, SHORT_REPORT_ID};
 use anyhow::{bail, Context, Result};
-use hidapi::HidDevice;
 use std::thread;
 use std::time::Duration;
 
@@ -64,7 +64,7 @@ pub struct ConnectionNotification {
 /// Build and write a HID++ 1.0 register request as a 7-byte short report,
 /// without waiting for a reply. Used fire-and-forget when the matching reply (or
 /// the notifications the request triggers) will be consumed by a reader loop.
-fn write_register(dev: &HidDevice, set: bool, register: u8, params: [u8; 3]) -> Result<()> {
+fn write_register(dev: &dyn HidLink, set: bool, register: u8, params: [u8; 3]) -> Result<()> {
     let sub_id = if set {
         SUB_SET_REGISTER
     } else {
@@ -86,7 +86,12 @@ fn write_register(dev: &HidDevice, set: bool, register: u8, params: [u8; 3]) -> 
 /// `set` chooses sub-id 0x80 (write) vs 0x81 (read). Requests go out as short
 /// (0x10) reports on the receiver's short collection. Returns the normalized
 /// 7-byte acknowledgement.
-fn register_request(dev: &HidDevice, set: bool, register: u8, params: [u8; 3]) -> Result<[u8; 7]> {
+fn register_request(
+    dev: &dyn HidLink,
+    set: bool,
+    register: u8,
+    params: [u8; 3],
+) -> Result<[u8; 7]> {
     let sub_id = if set {
         SUB_SET_REGISTER
     } else {
@@ -123,7 +128,7 @@ fn register_request(dev: &HidDevice, set: bool, register: u8, params: [u8; 3]) -
 
 /// Tell the receiver to push wireless connect/disconnect and battery
 /// notifications, and to treat us as the managing software. Best-effort.
-pub fn enable_notifications(dev: &HidDevice) -> Result<()> {
+pub fn enable_notifications(dev: &dyn HidLink) -> Result<()> {
     let flags = NOTIF_WIRELESS | NOTIF_SOFTWARE_PRESENT | NOTIF_BATTERY_STATUS;
     let params = [(flags >> 16) as u8, (flags >> 8) as u8, flags as u8];
     register_request(dev, true, REG_NOTIFICATIONS, params)?;
@@ -136,13 +141,13 @@ pub fn enable_notifications(dev: &HidDevice) -> Result<()> {
 /// including the `0x41` arrivals we care about — are consumed by the caller's
 /// read loop, so we must *not* wait for the register ack here (that would eat the
 /// connection notification that races ahead of it). Best-effort.
-pub fn poke_announce(dev: &HidDevice) -> Result<()> {
+pub fn poke_announce(dev: &dyn HidLink) -> Result<()> {
     write_register(dev, true, REG_CONNECTION_STATE, [ANNOUNCE_ALL, 0x00, 0x00])
 }
 
 /// Number of devices currently paired to the receiver, via register 0x02 (get).
 /// Best-effort; not all receivers answer.
-pub fn connected_count(dev: &HidDevice) -> Result<u8> {
+pub fn connected_count(dev: &dyn HidLink) -> Result<u8> {
     let reply = register_request(dev, false, REG_CONNECTION_STATE, [0x00, 0x00, 0x00])?;
     // Reply payload byte[1] (report[5]) carries the connected-device count —
     // confirmed on C547: GET reg 0x02 returned `10 FF 81 02 00 01 00` with one
