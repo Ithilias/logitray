@@ -16,6 +16,18 @@ pub fn display_name(raw: &str) -> String {
 /// (raw HID name, display name) — only for names that need correcting.
 static OVERRIDES: &[(&str, &str)] = &[];
 
+/// Name for a HID++ 1.0 device, which cannot report its own name the way
+/// feature 0x0005 does. Keyed by wireless product id; names follow Solaar's
+/// `descriptors.py`. Add an entry when someone reports another such device.
+pub fn name_for_wpid(wpid: u16) -> Option<&'static str> {
+    WPID_NAMES
+        .iter()
+        .find(|(id, _)| *id == wpid)
+        .map(|(_, name)| *name)
+}
+
+static WPID_NAMES: &[(u16, &str)] = &[(0x2010, "Wireless Illuminated Keyboard K800")];
+
 #[cfg(test)]
 mod tests {
     use super::display_name;

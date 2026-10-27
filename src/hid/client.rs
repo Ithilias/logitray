@@ -8,6 +8,10 @@
 //! long interface and emits an update. A relaxed safety timer re-reads battery
 //! (it changes slowly) and re-asserts notifications as a resume guard.
 //!
+//! Older HID++ 1.0 devices (e.g. the original K800) have no feature table. When
+//! enumeration fails, the worker falls back to their battery registers, which
+//! are read and pushed on the short interface instead.
+//!
 //! This replaces the old fixed-interval `poll_devices` sweep that blind-probed
 //! all six slots every cycle — the cause of the multi-second cold-boot delay.
 //! When a receiver exposes no short collection (no notifications), the worker
@@ -22,12 +26,12 @@ use crate::hid::protocol::{
     mv_to_percent, normalize_report, ping, ReportClass, ShortMsg, MAX_RETRIES, PING_RETRIES,
     PING_TIMEOUT_MS, READ_TIMEOUT_MS, SW_ID,
 };
-use crate::hid::receiver::{self};
+use crate::hid::receiver::{self, RegisterAnswer, BATTERY_REGISTERS};
 use crate::hid::scanner::{open_notifier, open_receiver, scan_receivers, ReceiverPath};
 use crate::model::{BatteryState, PollResult};
 use anyhow::{bail, Context, Result};
 use hidapi::HidApi;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -53,14 +57,356 @@ const MAX_MISSED_PING_CYCLES: u8 = 3;
 /// Direct USB HID++ devices address themselves at 0xFF.
 const DIRECT_DEVICE_INDEX: u8 = 0xFF;
 
-/// Per-device data that never changes while a device stays paired: which battery
-/// feature to use (and its table index) and the display name. Enumeration is
-/// many HID++ round-trips, so we do it once and reuse it. `battery` is `None`
-/// for devices that expose no battery feature.
+/// How long to wait for a device's answer to a HID++ 1.0 register request or
+/// to the protocol ping. These are sent once and never repeated: a 1.0 device
+/// takes one request at a time and refuses a repeat as busy while the first is
+/// pending. Solaar's `base.request` does the same with a 4 s window; half of
+/// that keeps the worker responsive.
+const DEVICE_REQUEST_TIMEOUT_MS: u64 = 2000;
+
+/// The same for a register request to the receiver itself (Solaar: 0.9 s).
+const RECEIVER_REQUEST_TIMEOUT_MS: u64 = 900;
+
+/// Most reports [`ShortLink`] queues for the worker loop while a register read
+/// is waiting. The short collection is quiet, so this is only a safety bound.
+const SHORT_BACKLOG_CAP: usize = 32;
+
+/// Where a device's battery reading comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BatterySource {
+    /// HID++ 2.0 battery feature id and its feature-table index (long collection).
+    Feature(u16, u8),
+    /// HID++ 1.0 battery register (short collection), for devices without a
+    /// feature table such as the original K800.
+    Register(u8),
+}
+
+impl BatterySource {
+    fn from_profile(profile: &DeviceProfile) -> Self {
+        match profile.battery_register {
+            Some(register) => Self::Register(register),
+            None => Self::Feature(profile.battery_feature_id, profile.battery_feature_index),
+        }
+    }
+
+    fn to_profile(self, name: String) -> DeviceProfile {
+        let (battery_feature_id, battery_feature_index, battery_register) = match self {
+            Self::Feature(id, idx) => (id, idx, None),
+            Self::Register(register) => (0, 0, Some(register)),
+        };
+        DeviceProfile {
+            battery_feature_id,
+            battery_feature_index,
+            battery_register,
+            name,
+        }
+    }
+}
+
+/// Per-device data that never changes while a device stays paired: where to
+/// read the battery and the display name. Enumeration is many HID++
+/// round-trips, so we do it once and reuse it. `battery` is `None` for devices
+/// that expose no battery feature.
 struct DeviceCache {
-    battery: Option<(u16, u8)>,
+    battery: Option<BatterySource>,
     display_name: String,
     wpid: u16,
+    /// Last battery level read, for readings that carry none.
+    last_percent: Option<u8>,
+    /// A HID++ 1.0 device whose battery notifications still need switching on.
+    notifications_pending: bool,
+}
+
+impl DeviceCache {
+    fn new(battery: Option<BatterySource>, display_name: String, wpid: u16) -> Self {
+        Self {
+            battery,
+            display_name,
+            wpid,
+            last_percent: None,
+            notifications_pending: matches!(battery, Some(BatterySource::Register(_))),
+        }
+    }
+}
+
+/// The receiver's short collection. HID++ 1.0 device register reads share it
+/// with the connection notifications the worker waits on, so a report that
+/// arrives while a read waits for its reply is queued for the worker loop
+/// instead of being dropped.
+struct ShortLink {
+    dev: Box<dyn HidLink>,
+    backlog: VecDeque<[u8; 7]>,
+}
+
+impl ShortLink {
+    fn new(dev: Box<dyn HidLink>) -> Self {
+        Self {
+            dev,
+            backlog: VecDeque::new(),
+        }
+    }
+
+    /// The next report: a queued one first, otherwise one read within
+    /// `timeout_ms`. `None` on timeout or a read too short to be HID++.
+    fn next_report(&mut self, timeout_ms: i32) -> Result<Option<[u8; 7]>> {
+        if let Some(report) = self.backlog.pop_front() {
+            return Ok(Some(report));
+        }
+        read_report(&*self.dev, timeout_ms).context("short interface read failed")
+    }
+
+    /// Queue a report for the worker loop.
+    fn queue(&mut self, report: [u8; 7]) {
+        push_bounded(&mut self.backlog, report);
+    }
+
+    /// Move reports already waiting on the collection into the backlog, so a
+    /// late answer to an earlier request cannot pass for the answer to the next.
+    fn drain_pending(&mut self) {
+        for _ in 0..SHORT_BACKLOG_CAP {
+            match read_report(&*self.dev, 0) {
+                Ok(Some(report)) => self.queue(report),
+                _ => break,
+            }
+        }
+    }
+
+    /// Send a HID++ 1.0 register request (`sub_id` 0x80 set / 0x81 get) to
+    /// `slot` (a device, or the receiver at 0xFF) once and wait for its
+    /// answer. A rejection is a [`receiver::RegisterRejected`] error.
+    fn register_request(
+        &mut self,
+        slot: u8,
+        sub_id: u8,
+        register: u8,
+        params: [u8; 3],
+    ) -> Result<[u8; 3]> {
+        let timeout = match slot {
+            receiver::RECEIVER_INDEX => RECEIVER_REQUEST_TIMEOUT_MS,
+            _ => DEVICE_REQUEST_TIMEOUT_MS,
+        };
+        self.drain_pending();
+        let request = receiver::register_frame(slot, sub_id, register, params);
+        self.dev.write(&request).context("HID write failed")?;
+        let dev = &*self.dev;
+        let answer = wait_for_register(
+            slot,
+            sub_id,
+            register,
+            Duration::from_millis(timeout),
+            &mut self.backlog,
+            |remaining| read_report(dev, remaining),
+        )?;
+        let Some(value) = answer else {
+            bail!("no reply from index {slot} for register 0x{register:02X}");
+        };
+        tracing::debug!(
+            "index {slot} register 0x{register:02X} (sub-id 0x{sub_id:02X}) = {value:02X?}"
+        );
+        Ok(value)
+    }
+
+    /// Read a HID++ 1.0 register from the device in `slot`.
+    fn read_register(&mut self, slot: u8, register: u8) -> Result<[u8; 3]> {
+        self.register_request(slot, receiver::SUB_GET_REGISTER, register, [0; 3])
+    }
+
+    /// Make the HID++ 1.0 device in `slot` push its battery register when the
+    /// level changes, keeping its other notification flags. Waits for the
+    /// write's acknowledgement: like Solaar, never send a 1.0 device a second
+    /// request while one is outstanding.
+    fn enable_battery_notifications(&mut self, slot: u8) -> Result<()> {
+        let current = self.read_register(slot, receiver::REG_DEVICE_NOTIFICATIONS)?;
+        if let Some(value) = receiver::with_battery_notifications(current) {
+            self.register_request(
+                slot,
+                receiver::SUB_SET_REGISTER,
+                receiver::REG_DEVICE_NOTIFICATIONS,
+                value,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// [`receiver::enable_notifications`] through the backlog, for the worker:
+    /// connection notifications arriving meanwhile are kept, not dropped.
+    fn enable_receiver_notifications(&mut self) -> Result<()> {
+        self.register_request(
+            receiver::RECEIVER_INDEX,
+            receiver::SUB_SET_REGISTER,
+            receiver::REG_NOTIFICATIONS,
+            receiver::notification_flags(),
+        )?;
+        Ok(())
+    }
+}
+
+/// Append to a bounded backlog. A full backlog drops its oldest report, so the
+/// latest connection state is what survives.
+fn push_bounded(backlog: &mut VecDeque<[u8; 7]>, report: [u8; 7]) {
+    if backlog.len() >= SHORT_BACKLOG_CAP {
+        backlog.pop_front();
+    }
+    backlog.push_back(report);
+}
+
+/// One normalized report from `dev` within `timeout_ms`; `None` on timeout or a
+/// read too short to be HID++.
+fn read_report(dev: &dyn HidLink, timeout_ms: i32) -> Result<Option<[u8; 7]>> {
+    let mut buf = [0u8; 21];
+    let n = dev
+        .read_timeout(&mut buf, timeout_ms)
+        .context("HID read failed")?;
+    Ok((n != 0).then(|| normalize_report(&buf, n)).flatten())
+}
+
+/// What a slot holds, as far as one HID++ 2.0 ping can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotProtocol {
+    /// Answered the ping: a HID++ 2.0 device.
+    Hidpp20,
+    /// Rejected the ping as an unknown sub-id: a HID++ 1.0 device.
+    Hidpp10,
+    /// The receiver says no device is connected there.
+    Absent,
+    /// Paired but not available right now (asleep, out of range, busy).
+    Unavailable,
+    /// No answer in time (e.g. still waking up), or an unexpected error.
+    Unknown,
+}
+
+impl SlotProtocol {
+    fn from_error(code: u8) -> Self {
+        match code {
+            receiver::ERR_INVALID_SUBID => Self::Hidpp10,
+            receiver::ERR_UNKNOWN_DEVICE => Self::Absent,
+            code if code == receiver::ERR_BUSY || receiver::is_unreachable(code) => {
+                Self::Unavailable
+            }
+            _ => Self::Unknown,
+        }
+    }
+}
+
+/// Tell HID++ 1.0 from 2.0 with one ping, as Solaar's `base.ping` does: a short
+/// report on the short collection. A 2.0 device answers on the long collection
+/// (verified on a C547 + G502 via `--diag`); a 1.0 device rejects the unknown
+/// sub-id with error 0x01, and the receiver answers for an empty or unreachable
+/// slot. Errors are short reports and arrive on the short collection (an empty
+/// slot's does, verified the same way); replies and errors are accepted on both
+/// collections, since a device may answer a short request short. Sent once, see
+/// [`DEVICE_REQUEST_TIMEOUT_MS`].
+fn detect_protocol(long: &mut dyn HidLink, short: &mut ShortLink, slot: u8) -> SlotProtocol {
+    let echo = 0x55 ^ slot;
+    let msg = ping(slot, echo);
+    let function_byte = (msg.function_id << 4) | SW_ID;
+    let answer = |report: &[u8; 7]| {
+        if matches_reply(msg, report) && report[6] == echo {
+            return Some(SlotProtocol::Hidpp20);
+        }
+        receiver::hidpp20_request_error(slot, msg.feature_index, function_byte, report)
+            .map(SlotProtocol::from_error)
+    };
+    short.drain_pending();
+    if short.dev.write(&msg.encode()).is_err() {
+        return SlotProtocol::Unknown;
+    }
+    let deadline = Instant::now() + Duration::from_millis(DEVICE_REQUEST_TIMEOUT_MS);
+    while Instant::now() < deadline {
+        match read_report(long, 10) {
+            Ok(Some(report)) => {
+                if let Some(protocol) = answer(&report) {
+                    return protocol;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return SlotProtocol::Unknown,
+        }
+        match read_report(&*short.dev, 10) {
+            Ok(Some(report)) => match answer(&report) {
+                Some(protocol) => return protocol,
+                None => short.queue(report),
+            },
+            Ok(None) => {}
+            Err(_) => return SlotProtocol::Unknown,
+        }
+    }
+    SlotProtocol::Unknown
+}
+
+/// Wait up to `timeout` for the answer to a register request, queueing every
+/// unrelated report in `backlog`. `Ok(None)` on timeout, a
+/// [`receiver::RegisterRejected`] error if the request was rejected.
+fn wait_for_register(
+    slot: u8,
+    sub_id: u8,
+    register: u8,
+    timeout: Duration,
+    backlog: &mut VecDeque<[u8; 7]>,
+    mut read: impl FnMut(i32) -> Result<Option<[u8; 7]>>,
+) -> Result<Option<[u8; 3]>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+        let milliseconds = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+        let Some(report) = read(milliseconds)? else {
+            continue;
+        };
+        match receiver::match_register_answer(slot, sub_id, register, &report) {
+            RegisterAnswer::Value(value) => return Ok(Some(value)),
+            RegisterAnswer::Rejected(code) => {
+                return Err(receiver::RegisterRejected { register, code })
+                    .with_context(|| format!("index {slot}"));
+            }
+            RegisterAnswer::Unrelated => push_bounded(backlog, report),
+        }
+    }
+}
+
+/// True when `err` says the register itself is gone (the device no longer has
+/// it, or no longer speaks HID++ 1.0), as opposed to a device that is asleep,
+/// busy or slow to answer.
+fn register_is_gone(err: &anyhow::Error) -> bool {
+    rejection_code(err).is_some_and(|code| {
+        matches!(
+            code,
+            receiver::ERR_INVALID_ADDRESS | receiver::ERR_INVALID_SUBID
+        )
+    })
+}
+
+/// True when `err` says the device cannot answer right now (busy, asleep, out
+/// of range), so nothing can be learned about its registers from it.
+fn device_is_unavailable(err: &anyhow::Error) -> bool {
+    rejection_code(err)
+        .is_some_and(|code| code == receiver::ERR_BUSY || receiver::is_unreachable(code))
+}
+
+/// A device that is paired but cannot answer right now (asleep, out of range,
+/// busy). Its slot is resolved again when the device speaks up.
+#[derive(Debug)]
+struct Unavailable {
+    slot: u8,
+}
+
+impl std::fmt::Display for Unavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "device at index {} is not available right now (asleep, out of range or busy)",
+            self.slot
+        )
+    }
+}
+
+impl std::error::Error for Unavailable {}
+
+fn rejection_code(err: &anyhow::Error) -> Option<u8> {
+    err.downcast_ref::<receiver::RegisterRejected>()
+        .map(|rejected| rejected.code)
 }
 
 /// Cache of [`DeviceCache`] keyed by `device_key` ("receiver-path:index"), held for the
@@ -69,11 +415,33 @@ struct DeviceCache {
 pub struct FeatureCache {
     devices: HashMap<String, DeviceCache>,
     missed_ping_cycles: HashMap<String, u8>,
+    /// WPID of each slot the receiver announced as linked up.
+    announced: HashMap<String, u16>,
+    /// Announced slots whose device could not be resolved because it was
+    /// [`Unavailable`] (asleep, busy).
+    unavailable: HashSet<String>,
 }
 
 impl FeatureCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The WPID of a slot that was announced as linked up but could not be
+    /// resolved because its device was unavailable (asleep, busy). Only those:
+    /// a device that failed for any other reason would just fail again.
+    fn unresolved_announcement(&self, key: &str) -> Option<u16> {
+        self.announced
+            .get(key)
+            .copied()
+            .filter(|_| self.unavailable.contains(key) && !self.devices.contains_key(key))
+    }
+
+    /// Whether the device under `key` is read through a HID++ 1.0 register.
+    fn reads_register(&self, key: &str) -> bool {
+        self.devices
+            .get(key)
+            .is_some_and(|entry| matches!(entry.battery, Some(BatterySource::Register(_))))
     }
 }
 
@@ -142,7 +510,7 @@ where
     let mut long = open_receiver(&api, receiver).context("failed to open device interface")?;
     let short = open_notifier(&api, receiver)
         .ok()
-        .map(|dev| Box::new(dev) as Box<dyn HidLink>);
+        .map(|dev| ShortLink::new(Box::new(dev)));
     run_worker_on(
         &mut long,
         short,
@@ -157,7 +525,7 @@ where
 /// The worker proper, on already-open collections (simulated ones in tests).
 fn run_worker_on<F>(
     long: &mut dyn HidLink,
-    short: Option<Box<dyn HidLink>>,
+    mut short: Option<ShortLink>,
     receiver: &ReceiverPath,
     mut profiles: DeviceProfiles,
     safety_secs: u64,
@@ -167,8 +535,7 @@ fn run_worker_on<F>(
 where
     F: Fn(DeviceEvent),
 {
-    let short = short.as_deref();
-    if detect_direct_usb(long, short) {
+    if detect_direct_usb(long, short.as_ref().map(|link| &*link.dev)) {
         return run_direct_worker(long, receiver, safety_secs, cmd_rx, emit);
     }
     if short.is_none() {
@@ -185,9 +552,9 @@ where
     // Initial discovery. With notifications, enable them and ask the receiver to
     // announce its connected devices — the resulting 0x41 reports drive the read
     // loop below. Without, probe slots directly.
-    if let Some(short) = short {
+    if let Some(short) = &short {
         // Notification setup was already attempted during transport detection.
-        let _ = receiver::poke_announce(short);
+        let _ = receiver::poke_announce(&*short.dev);
     } else {
         discover_by_ping(long, receiver, &mut cache, &mut profiles, &mut known, emit);
     }
@@ -196,26 +563,55 @@ where
     loop {
         // Primary wait: a connection notification on the short interface, or a
         // timeout that lets us service commands and the safety timer.
-        if let Some(short) = short {
-            let mut buf = [0u8; 21];
-            match short.read_timeout(&mut buf, SHORT_WAIT_MS) {
-                Ok(0) => {}
-                Ok(n) => {
-                    if let Some(report) = normalize_report(&buf, n) {
-                        if let Some(conn) = receiver::parse_connection(&report) {
-                            handle_connection(
-                                conn,
-                                long,
-                                receiver,
-                                &mut cache,
-                                &mut profiles,
-                                &mut known,
-                                emit,
-                            );
-                        }
+        if let Some(short) = &mut short {
+            if let Some(report) = short.next_report(SHORT_WAIT_MS)? {
+                if let Some(conn) = receiver::parse_connection(&report) {
+                    handle_connection(
+                        conn,
+                        long,
+                        Some(short),
+                        receiver,
+                        &mut cache,
+                        &mut profiles,
+                        &mut known,
+                        emit,
+                    );
+                } else if receiver::is_battery_notification(&report) {
+                    let slot = report[1];
+                    let key = device_key(receiver, slot);
+                    if cache.reads_register(&key) {
+                        // A HID++ 1.0 device pushed a battery change. (A 2.0
+                        // device's short event can look the same; it is not ours.)
+                        reread_after_event(
+                            slot,
+                            long,
+                            Some(short),
+                            receiver,
+                            &mut cache,
+                            &mut profiles,
+                            &known,
+                            emit,
+                        );
+                    } else if let Some(wpid) = cache.unresolved_announcement(&key) {
+                        // Announced while it could not be resolved (asleep at a
+                        // cold start); now it speaks up, so resolve it.
+                        let conn = receiver::ConnectionNotification {
+                            device_index: slot,
+                            link_established: true,
+                            wpid,
+                        };
+                        handle_connection(
+                            conn,
+                            long,
+                            Some(short),
+                            receiver,
+                            &mut cache,
+                            &mut profiles,
+                            &mut known,
+                            emit,
+                        );
                     }
                 }
-                Err(err) => bail!("short interface read failed: {err}"),
             }
         } else {
             // No notifications to wait on — idle until the next command/safety tick.
@@ -225,14 +621,22 @@ where
         // Drain any unsolicited HID++ 2.0 battery events the device pushed on the
         // long interface (e.g. charging started/stopped) and reflect them right
         // away rather than waiting for the safety re-read.
-        drain_long_events(long, receiver, &mut cache, &mut profiles, &known, emit);
+        drain_long_events(
+            long,
+            short.as_mut(),
+            receiver,
+            &mut cache,
+            &mut profiles,
+            &known,
+            emit,
+        );
 
         // Drain pending commands.
         loop {
             match cmd_rx.try_recv() {
                 Ok(WorkerCommand::Refresh) => {
-                    if let Some(short) = short {
-                        let _ = receiver::poke_announce(short);
+                    if let Some(short) = &short {
+                        let _ = receiver::poke_announce(&*short.dev);
                     } else {
                         discover_by_ping(
                             long,
@@ -243,7 +647,7 @@ where
                             emit,
                         );
                     }
-                    reread_known(long, receiver, &mut cache, &known, emit);
+                    reread_known(long, short.as_mut(), receiver, &mut cache, &known, emit);
                 }
                 Ok(WorkerCommand::SetSafetyInterval(secs)) => {
                     safety = Duration::from_secs(secs.max(MIN_SAFETY_SECS));
@@ -257,13 +661,13 @@ where
         // Safety timer: re-assert notifications (resume guard), re-discover on
         // the no-notification path, and re-read battery for known devices.
         if last_safety.elapsed() >= safety {
-            if let Some(short) = short {
-                let _ = receiver::enable_notifications(short);
-                let _ = receiver::poke_announce(short);
+            if let Some(short) = &mut short {
+                let _ = short.enable_receiver_notifications();
+                let _ = receiver::poke_announce(&*short.dev);
             } else {
                 discover_by_ping(long, receiver, &mut cache, &mut profiles, &mut known, emit);
             }
-            reread_known(long, receiver, &mut cache, &known, emit);
+            reread_known(long, short.as_mut(), receiver, &mut cache, &known, emit);
             last_safety = Instant::now();
         }
     }
@@ -329,6 +733,7 @@ where
         if Instant::now() >= next_read {
             match read_device(
                 long,
+                None,
                 DIRECT_DEVICE_INDEX,
                 receiver,
                 0,
@@ -351,7 +756,15 @@ where
         }
         // Direct devices have no receiver connection announcements. Their
         // battery events arrive on the long interface and use index 0xFF.
-        drain_long_events(long, receiver, &mut cache, &mut profiles, &known, emit);
+        drain_long_events(
+            long,
+            None,
+            receiver,
+            &mut cache,
+            &mut profiles,
+            &known,
+            emit,
+        );
         let wait = next_read
             .saturating_duration_since(Instant::now())
             .min(Duration::from_secs(1));
@@ -369,9 +782,11 @@ where
 
 /// React to a device-connection notification: read battery on link-up, emit a
 /// departure on link-down.
+#[allow(clippy::too_many_arguments)]
 fn handle_connection<F>(
     conn: receiver::ConnectionNotification,
     long: &mut dyn HidLink,
+    short: Option<&mut ShortLink>,
     receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     profiles: &mut DeviceProfiles,
@@ -388,9 +803,11 @@ fn handle_connection<F>(
     if conn.link_established {
         let key = device_key(receiver, slot);
         if invalidate_changed_device(cache, &key, conn.wpid) && known.remove(&slot) {
-            emit(DeviceEvent::Gone(key));
+            emit(DeviceEvent::Gone(key.clone()));
         }
-        match read_device(long, slot, receiver, conn.wpid, cache, profiles) {
+        cache.announced.insert(key.clone(), conn.wpid);
+        cache.unavailable.remove(&key);
+        match read_device(long, short, slot, receiver, conn.wpid, cache, profiles) {
             Ok(Some(state)) => {
                 let newly = known.insert(slot);
                 if newly {
@@ -403,7 +820,18 @@ fn handle_connection<F>(
                 emit(DeviceEvent::Update(state));
             }
             Ok(None) => {} // device with no battery feature — ignore
-            Err(err) => tracing::warn!("receiver {pid:04X} index {slot}: {err}"),
+            Err(err) => {
+                // Resolved but not readable yet (e.g. charging and no level
+                // reported): keep it known so its pushes and the safety
+                // re-read reach it.
+                if cache.devices.contains_key(&key) {
+                    known.insert(slot);
+                }
+                if err.downcast_ref::<Unavailable>().is_some() {
+                    cache.unavailable.insert(key);
+                }
+                tracing::warn!("receiver {pid:04X} index {slot}: {err}");
+            }
         }
     } else {
         if forget_slot(receiver, slot, cache, known) {
@@ -413,9 +841,48 @@ fn handle_connection<F>(
     }
 }
 
+/// A known device pushed a battery event (a HID++ 2.0 feature event, or a
+/// HID++ 1.0 battery notification): re-read it and emit the fresh reading.
+/// Re-reading rather than decoding the push also covers a 1.0 push that carries
+/// only a charging change and no level.
+#[allow(clippy::too_many_arguments)]
+fn reread_after_event<F>(
+    slot: u8,
+    long: &mut dyn HidLink,
+    short: Option<&mut ShortLink>,
+    receiver: &ReceiverPath,
+    cache: &mut FeatureCache,
+    profiles: &mut DeviceProfiles,
+    known: &BTreeSet<u8>,
+    emit: &F,
+) where
+    F: Fn(DeviceEvent),
+{
+    if !known.contains(&slot) {
+        return;
+    }
+    match read_device(long, short, slot, receiver, 0, cache, profiles) {
+        Ok(Some(state)) => {
+            tracing::info!(
+                "battery event: {} — {}%{}",
+                state.display_name,
+                state.battery_percent,
+                if state.is_charging { " (charging)" } else { "" }
+            );
+            emit(DeviceEvent::Update(state));
+        }
+        Ok(None) => {}
+        Err(err) => tracing::debug!(
+            "receiver {:04X} index {slot} event re-read: {err}",
+            receiver.pid
+        ),
+    }
+}
+
 /// Re-read battery for every currently-known device (safety timer / refresh).
 fn reread_known<F>(
     long: &mut dyn HidLink,
+    mut short: Option<&mut ShortLink>,
     receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     known: &BTreeSet<u8>,
@@ -427,6 +894,7 @@ fn reread_known<F>(
     for &slot in known {
         match read_device(
             long,
+            short.as_deref_mut(),
             slot,
             receiver,
             0,
@@ -447,6 +915,7 @@ fn reread_known<F>(
 /// reports are queued.
 fn drain_long_events<F>(
     long: &mut dyn HidLink,
+    mut short: Option<&mut ShortLink>,
     receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     profiles: &mut DeviceProfiles,
@@ -455,7 +924,6 @@ fn drain_long_events<F>(
 ) where
     F: Fn(DeviceEvent),
 {
-    let pid = receiver.pid;
     for _ in 0..32 {
         let mut buf = [0u8; 21];
         // Timeout 0 = non-blocking: return immediately if nothing is queued.
@@ -465,25 +933,16 @@ fn drain_long_events<F>(
                     continue;
                 };
                 if let ReportClass::FeatureEvent { device_index, .. } = classify(&report) {
-                    if known.contains(&device_index) {
-                        match read_device(long, device_index, receiver, 0, cache, profiles) {
-                            Ok(Some(state)) => {
-                                tracing::info!(
-                                    "battery event: {} — {}%{}",
-                                    state.display_name,
-                                    state.battery_percent,
-                                    if state.is_charging { " (charging)" } else { "" }
-                                );
-                                emit(DeviceEvent::Update(state));
-                            }
-                            Ok(None) => {}
-                            Err(err) => {
-                                tracing::debug!(
-                                    "receiver {pid:04X} index {device_index} event re-read: {err}"
-                                )
-                            }
-                        }
-                    }
+                    reread_after_event(
+                        device_index,
+                        long,
+                        short.as_deref_mut(),
+                        receiver,
+                        cache,
+                        profiles,
+                        known,
+                        emit,
+                    );
                 }
             }
             // Timeout (nothing queued) or read error: stop draining.
@@ -513,7 +972,8 @@ fn discover_by_ping<F>(
         if !responded {
             continue;
         }
-        match read_device(long, slot, receiver, 0, cache, profiles) {
+        // No short collection on this path, so HID++ 1.0 devices stay unread.
+        match read_device(long, None, slot, receiver, 0, cache, profiles) {
             Ok(Some(state)) => {
                 known.insert(slot);
                 emit(DeviceEvent::Update(state));
@@ -568,6 +1028,8 @@ fn forget_slot(
     let key = device_key(receiver, slot);
     cache.devices.remove(&key);
     cache.missed_ping_cycles.remove(&key);
+    cache.announced.remove(&key);
+    cache.unavailable.remove(&key);
     known.remove(&slot)
 }
 
@@ -590,6 +1052,7 @@ fn invalidate_changed_device(cache: &mut FeatureCache, key: &str, wpid: u16) -> 
 /// and rewrites the profile if the cached feature index no longer works.
 fn read_device(
     dev: &mut dyn HidLink,
+    mut short: Option<&mut ShortLink>,
     slot: u8,
     receiver: &ReceiverPath,
     wpid: u16,
@@ -600,16 +1063,38 @@ fn read_device(
 
     invalidate_changed_device(cache, &key, wpid);
     if !cache.devices.contains_key(&key) {
-        let entry = resolve_device(dev, slot, wpid, profiles)?;
+        let entry = resolve_device(dev, short.as_deref_mut(), slot, wpid, profiles)?;
         cache.devices.insert(key.clone(), entry);
     }
 
-    let entry = &cache.devices[&key];
-    let Some((feature_id, feature_idx)) = entry.battery else {
+    let Some(source) = cache.devices[&key].battery else {
         return Ok(None);
     };
+    let (level, is_charging) = read_source(dev, short.as_deref_mut(), slot, source)?;
+    let entry = cache.devices.get_mut(&key).expect("resolved above");
+    // The device forgets this setting when it powers off, and it may have been
+    // asleep when last asked, so retry after each good read until it took
+    // (Solaar re-sends it on every reconnect). A good read is enough, level or
+    // not: a docked device reporting none is exactly the one whose pushes we
+    // need. A device without the register is not asked again.
+    if entry.notifications_pending {
+        if let Some(short) = short {
+            match short.enable_battery_notifications(slot) {
+                Ok(()) => entry.notifications_pending = false,
+                Err(err) => {
+                    entry.notifications_pending = !register_is_gone(&err);
+                    tracing::debug!("index {slot}: battery notifications not enabled: {err}");
+                }
+            }
+        }
+    }
+    // A charging HID++ 1.0 device may report no level; keep showing its last
+    // one. Only while charging: a stale low level must not outlive the charge.
+    let Some(battery_percent) = level.or(entry.last_percent.filter(|_| is_charging)) else {
+        bail!("index {slot} reports no battery level");
+    };
+    entry.last_percent = Some(battery_percent);
     let display_name = entry.display_name.clone();
-    let (battery_percent, is_charging) = read_battery(dev, slot, feature_id, feature_idx)?;
 
     Ok(Some(BatteryState {
         device_key: key,
@@ -622,10 +1107,13 @@ fn read_device(
 }
 
 /// Build a [`DeviceCache`] entry for a slot — via the persisted profile when the
-/// WPID is known and the cached battery feature still answers, otherwise via
-/// live feature enumeration (which then updates the persisted profile).
+/// WPID is known and the cached battery source still answers, otherwise via
+/// live feature enumeration (which then updates the persisted profile). A
+/// device that has no HID++ 2.0 feature table gets one more chance as a HID++
+/// 1.0 device with a battery register.
 fn resolve_device(
     dev: &mut dyn HidLink,
+    mut short: Option<&mut ShortLink>,
     slot: u8,
     wpid: u16,
     profiles: &mut DeviceProfiles,
@@ -633,25 +1121,59 @@ fn resolve_device(
     // Fast path: trust a persisted profile, validated by an actual battery read.
     if wpid != 0 {
         if let Some(profile) = profiles.get(wpid) {
-            let id = profile.battery_feature_id;
-            let idx = profile.battery_feature_index;
-            if read_battery(dev, slot, id, idx).is_ok() {
-                return Ok(DeviceCache {
-                    battery: Some((id, idx)),
-                    display_name: profile.name.clone(),
-                    wpid,
-                });
+            let source = BatterySource::from_profile(profile);
+            let cached = DeviceCache::new(Some(source), profile.name.clone(), wpid);
+            match read_source(dev, short.as_deref_mut(), slot, source) {
+                Ok(_) => return Ok(cached),
+                // A register device that is asleep, busy or slow keeps its
+                // profile: resolving again cannot do better, and would cost the
+                // whole slow path on every announcement. Its own push, or the
+                // next announcement, resolves it once it answers.
+                Err(err)
+                    if matches!(source, BatterySource::Register(_)) && !register_is_gone(&err) =>
+                {
+                    return Err(err.context(Unavailable { slot }));
+                }
+                Err(_) => tracing::info!("WPID {wpid:04X} cached feature stale — re-enumerating"),
             }
-            tracing::info!("WPID {wpid:04X} cached feature stale — re-enumerating");
         }
     }
 
-    // Slow path: enumerate features (with a bounded retry, since a just-woken
-    // device often flubs the first attempt) and pick a battery feature.
-    let feature_map = build_feature_map_retry(dev, slot)?;
-    let battery = [0x1000u16, 0x1001, 0x1004]
-        .iter()
-        .find_map(|&id| feature_map.get(&id).map(|&idx| (id, idx)));
+    // Slow path. A HID++ 1.0 device never answers feature enumeration (its
+    // rejections go to the short collection), so tell the protocols apart first
+    // instead of waiting out every enumeration timeout.
+    let mut protocol = SlotProtocol::Unknown;
+    if let Some(short) = short.as_deref_mut() {
+        protocol = detect_protocol(dev, short, slot);
+        match protocol {
+            SlotProtocol::Hidpp10 => {
+                return resolve_register_device(short, slot, wpid, profiles)?
+                    .context("HID++ 1.0 device answers no battery register");
+            }
+            SlotProtocol::Absent => bail!("no device connected at index {slot}"),
+            SlotProtocol::Unavailable => return Err(Unavailable { slot }.into()),
+            SlotProtocol::Hidpp20 | SlotProtocol::Unknown => {}
+        }
+    }
+
+    // Enumerate features (with a bounded retry, since a just-woken device often
+    // flubs the first attempt) and pick a battery feature.
+    let feature_map = match build_feature_map_retry(dev, slot) {
+        Ok(map) => map,
+        // Only when the ping went unanswered: a 1.0 device still gets its
+        // register probe. A device that answered as 2.0 never does.
+        Err(err) => match short {
+            Some(short) if protocol == SlotProtocol::Unknown => {
+                return resolve_register_device(short, slot, wpid, profiles)?.ok_or(err);
+            }
+            _ => return Err(err),
+        },
+    };
+    let battery = [0x1000u16, 0x1001, 0x1004].iter().find_map(|&id| {
+        feature_map
+            .get(&id)
+            .map(|&idx| BatterySource::Feature(id, idx))
+    });
 
     let display_name = match battery {
         Some(_) => read_device_name(dev, slot, &feature_map)
@@ -659,32 +1181,74 @@ fn resolve_device(
         None => String::new(),
     };
 
-    // Persist what we learned so the next cold boot can skip all of the above.
-    if wpid != 0 {
-        if let Some((id, idx)) = battery {
-            let profile = DeviceProfile {
-                battery_feature_id: id,
-                battery_feature_index: idx,
-                name: display_name.clone(),
-            };
-            // Update this worker's own snapshot, then merge the one entry into
-            // the file. Writing the whole snapshot back would drop whatever
-            // another receiver's worker has learned since this thread started.
-            // Tests drive this with simulated devices; their profiles stay in
-            // memory rather than landing in the real devices.toml.
-            if profiles.upsert(wpid, profile.clone()) && cfg!(not(test)) {
-                if let Err(err) = config::save_device_profile(wpid, profile) {
-                    tracing::debug!("failed saving device profile: {err}");
-                }
-            }
-        }
+    if let Some(battery) = battery {
+        remember_profile(profiles, wpid, battery, &display_name);
     }
 
-    Ok(DeviceCache {
-        battery,
-        display_name,
-        wpid,
-    })
+    Ok(DeviceCache::new(battery, display_name, wpid))
+}
+
+/// Resolve a HID++ 1.0 device through its battery registers: `Ok(None)` if it
+/// answers none.
+fn resolve_register_device(
+    short: &mut ShortLink,
+    slot: u8,
+    wpid: u16,
+    profiles: &mut DeviceProfiles,
+) -> Result<Option<DeviceCache>> {
+    let Some(register) = probe_battery_register(short, slot)? else {
+        return Ok(None);
+    };
+    tracing::info!("index {slot}: HID++ 1.0 device, battery register 0x{register:02X}");
+    let display_name = device_map::name_for_wpid(wpid)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("Logitech Device (index {slot})"));
+    let battery = BatterySource::Register(register);
+    remember_profile(profiles, wpid, battery, &display_name);
+    // Battery notifications are switched on after the first successful read.
+    Ok(Some(DeviceCache::new(Some(battery), display_name, wpid)))
+}
+
+/// Persist what we learned so the next cold boot can skip resolving it again.
+fn remember_profile(
+    profiles: &mut DeviceProfiles,
+    wpid: u16,
+    battery: BatterySource,
+    display_name: &str,
+) {
+    if wpid == 0 {
+        return;
+    }
+    let profile = battery.to_profile(display_name.to_string());
+    // Update this worker's own snapshot, then merge the one entry into
+    // the file. Writing the whole snapshot back would drop whatever
+    // another receiver's worker has learned since this thread started.
+    // Tests drive this with simulated devices; their profiles stay in memory
+    // rather than landing in the real devices.toml.
+    if profiles.upsert(wpid, profile.clone()) && cfg!(not(test)) {
+        if let Err(err) = config::save_device_profile(wpid, profile) {
+            tracing::debug!("failed saving device profile: {err}");
+        }
+    }
+}
+
+/// The first battery register a HID++ 1.0 device answers, probed in Solaar's
+/// order. An answer is enough: a 0x07 value without a level (charging-only)
+/// still identifies the register, and the next read gets the level.
+///
+/// The choice is remembered for good, so a device that cannot answer right now
+/// (busy, asleep) ends the probe with an error rather than moving on and
+/// settling on the coarser register; a rejected or unanswered register is
+/// taken as absent, as Solaar does.
+fn probe_battery_register(short: &mut ShortLink, slot: u8) -> Result<Option<u8>> {
+    for register in BATTERY_REGISTERS {
+        match short.read_register(slot, register) {
+            Ok(_) => return Ok(Some(register)),
+            Err(err) if device_is_unavailable(&err) => return Err(err),
+            Err(err) => tracing::debug!("battery register probe: {err}"),
+        }
+    }
+    Ok(None)
 }
 
 /// One-shot synchronous read of every connected device across all receivers,
@@ -714,14 +1278,10 @@ pub fn poll_once() -> PollResult {
                 continue;
             }
         };
-        let short = open_notifier(&api, &receiver).ok();
-        poll_receiver(
-            &mut long,
-            short.as_ref().map(|dev| dev as &dyn HidLink),
-            &receiver,
-            &mut profiles,
-            &mut result,
-        );
+        let short = open_notifier(&api, &receiver)
+            .ok()
+            .map(|dev| ShortLink::new(Box::new(dev)));
+        poll_receiver(&mut long, short, &receiver, &mut profiles, &mut result);
     }
 
     result.sort_devices();
@@ -732,14 +1292,20 @@ pub fn poll_once() -> PollResult {
 /// tests): discover the present slots and read each, into `result`.
 fn poll_receiver(
     long: &mut dyn HidLink,
-    short: Option<&dyn HidLink>,
+    mut short: Option<ShortLink>,
     receiver: &ReceiverPath,
     profiles: &mut DeviceProfiles,
     result: &mut PollResult,
 ) {
     let mut cache = FeatureCache::new();
-    for (slot, wpid) in discover_present_slots(long, short) {
-        match read_device(long, slot, receiver, wpid, &mut cache, profiles) {
+    let slots = discover_present_slots(long, short.as_ref().map(|link| &*link.dev));
+    for (slot, wpid) in slots {
+        // A wired device has no HID++ 1.0 side; the worker passes none either.
+        let short = match slot {
+            DIRECT_DEVICE_INDEX => None,
+            _ => short.as_mut(),
+        };
+        match read_device(long, short, slot, receiver, wpid, &mut cache, profiles) {
             Ok(Some(state)) => result.devices.push(state),
             Ok(None) => {}
             Err(err) => result
@@ -886,6 +1452,25 @@ fn read_device_name(
     Ok(device_map::display_name(&name))
 }
 
+fn read_source(
+    dev: &mut dyn HidLink,
+    short: Option<&mut ShortLink>,
+    device_index: u8,
+    source: BatterySource,
+) -> Result<(Option<u8>, bool)> {
+    match source {
+        BatterySource::Feature(id, idx) => {
+            let (percent, charging) = read_battery(dev, device_index, id, idx)?;
+            Ok((Some(percent), charging))
+        }
+        BatterySource::Register(register) => {
+            let short = short.context("HID++ 1.0 battery needs the short collection")?;
+            let value = short.read_register(device_index, register)?;
+            receiver::parse_battery_register(register, value)
+        }
+    }
+}
+
 fn read_battery(
     dev: &mut dyn HidLink,
     device_index: u8,
@@ -1016,9 +1601,11 @@ mod tests {
             cache.devices.insert(
                 device_key(&receiver, slot),
                 DeviceCache {
-                    battery: Some((0x1000, 5)),
+                    battery: Some(BatterySource::Feature(0x1000, 5)),
                     display_name: "old".into(),
                     wpid: 10,
+                    last_percent: None,
+                    notifications_pending: false,
                 },
             );
         }
@@ -1046,9 +1633,11 @@ mod tests {
         cache.devices.insert(
             key.clone(),
             DeviceCache {
-                battery: Some((0x1000, 5)),
+                battery: Some(BatterySource::Feature(0x1000, 5)),
                 display_name: "Mouse".into(),
                 wpid: 10,
+                last_percent: None,
+                notifications_pending: false,
             },
         );
         let mut known = BTreeSet::from([1, 2]);
@@ -1147,6 +1736,67 @@ mod tests {
         assert!(!matches_error(msg, &[0x11, 2, 0xFF, 5, 0x1A, 2, 0]));
     }
     #[test]
+    fn register_read_keeps_notifications_that_arrive_meanwhile() {
+        // Slot 1's connection notification lands while slot 4's register read
+        // waits; the worker loop must still see it afterwards.
+        let conn = [0x10, 1, 0x41, 0x04, 0x02, 0x6A, 0x40];
+        let reply = [0x10, 4, 0x81, 0x07, 5, 0, 0];
+        let mut reports = vec![conn, reply].into_iter();
+        let mut backlog = VecDeque::new();
+        let value = wait_for_register(4, 0x81, 0x07, Duration::from_secs(1), &mut backlog, |_| {
+            Ok(reports.next())
+        })
+        .unwrap();
+        assert_eq!(value, Some([5, 0, 0]));
+        assert_eq!(backlog, VecDeque::from([conn]));
+
+        // A rejection is an error, not a timeout, and leaves the backlog alone.
+        let error = [0x10, 4, 0x8F, 0x81, 0x0D, 0x02, 0];
+        let mut backlog = VecDeque::new();
+        assert!(
+            wait_for_register(4, 0x81, 0x0D, Duration::from_secs(1), &mut backlog, |_| Ok(
+                Some(error)
+            ))
+            .is_err()
+        );
+        assert!(backlog.is_empty());
+
+        // Endless unrelated traffic times out and stays bounded.
+        let mut backlog = VecDeque::new();
+        let value = wait_for_register(
+            4,
+            0x81,
+            0x07,
+            Duration::from_millis(20),
+            &mut backlog,
+            |_| Ok(Some(conn)),
+        )
+        .unwrap();
+        assert!(value.is_none());
+        assert_eq!(backlog.len(), SHORT_BACKLOG_CAP);
+    }
+
+    #[test]
+    fn battery_source_roundtrips_through_profiles() {
+        for source in [
+            BatterySource::Feature(0x1004, 8),
+            BatterySource::Register(0x07),
+        ] {
+            let profile = source.to_profile("Device".into());
+            assert_eq!(BatterySource::from_profile(&profile), source);
+        }
+        assert_eq!(
+            BatterySource::Register(0x07).to_profile("K800".into()),
+            DeviceProfile {
+                battery_feature_id: 0,
+                battery_feature_index: 0,
+                battery_register: Some(0x07),
+                name: "K800".into(),
+            }
+        );
+    }
+
+    #[test]
     fn continuous_unrelated_reports_cannot_extend_deadline() {
         let start = Instant::now();
         let result = wait_for_response(
@@ -1161,11 +1811,13 @@ mod tests {
 }
 
 /// End-to-end tests against [`crate::hid::sim`]: the worker and `--once` paths
-/// driving a simulated receiver.
+/// driving a simulated receiver with a HID++ 2.0 mouse and a HID++ 1.0 K800.
 #[cfg(test)]
 mod sim_tests {
     use super::*;
-    use crate::hid::sim::{Collection, SimDevice, SimReceiver};
+    use crate::hid::sim::{Collection, ErrorRoute, SimDevice, SimReceiver};
+
+    const K800_NAME: &str = "Wireless Illuminated Keyboard K800";
 
     fn receiver() -> ReceiverPath {
         ReceiverPath {
@@ -1176,25 +1828,19 @@ mod sim_tests {
         }
     }
 
-    fn short_link(sim: &SimReceiver) -> Option<Box<dyn HidLink>> {
-        Some(sim.link(Collection::Short))
+    fn short_link(sim: &SimReceiver) -> Option<ShortLink> {
+        Some(ShortLink::new(sim.link(Collection::Short)))
     }
 
     /// `--once` against the simulator; devices sorted by slot.
     fn poll(
         sim: &SimReceiver,
-        short: Option<Box<dyn HidLink>>,
+        short: Option<ShortLink>,
         profiles: &mut DeviceProfiles,
     ) -> PollResult {
         let mut result = PollResult::default();
         let mut long = sim.link(Collection::Long);
-        poll_receiver(
-            &mut *long,
-            short.as_deref(),
-            &receiver(),
-            profiles,
-            &mut result,
-        );
+        poll_receiver(&mut *long, short, &receiver(), profiles, &mut result);
         result.devices.sort_by_key(|d| d.device_index);
         result
     }
@@ -1208,6 +1854,31 @@ mod sim_tests {
                 (d.device_index, name, d.battery_percent, d.is_charging)
             })
             .collect()
+    }
+
+    fn register_reads(writes: &[Vec<u8>], register: u8) -> usize {
+        writes
+            .iter()
+            .filter(|w| w[2] == 0x81 && w[3] == register)
+            .count()
+    }
+
+    /// HID++ 1.0 register requests (sub-id 0x80 set / 0x81 get) among `writes`.
+    fn register_requests(writes: &[Vec<u8>]) -> usize {
+        writes
+            .iter()
+            .filter(|w| w[2] == 0x80 || w[2] == 0x81)
+            .count()
+    }
+
+    fn hidpp10(registers: &[(u8, [u8; 3])], error_route: ErrorRoute) -> SimDevice {
+        let mut registers: HashMap<u8, [u8; 3]> = registers.iter().copied().collect();
+        registers.insert(0x00, [0, 0, 0]);
+        SimDevice::Hidpp10 {
+            wpid: 0x2010,
+            registers,
+            error_route,
+        }
     }
 
     #[test]
@@ -1282,6 +1953,372 @@ mod sim_tests {
             .writes_to(Collection::Long, 2)
             .iter()
             .any(|w| w[2] == 0x00 && w[3] >> 4 == 1));
+    }
+
+    #[test]
+    fn k800_cold_start_reads_its_register_and_remembers_it() {
+        let sim = SimReceiver::new()
+            .with(1, SimDevice::g502(68))
+            .with(4, SimDevice::k800([0x05, 0x21, 0x00]));
+        let mut profiles = DeviceProfiles::default();
+        let start = Instant::now();
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(
+            summary(&result),
+            [(1, "G502 X PLUS", 68, false), (4, K800_NAME, 50, true)]
+        );
+        // The protocol ping went out short; nothing on the long collection.
+        assert!(sim.writes_to(Collection::Long, 4).is_empty());
+        assert!(start.elapsed() < Duration::from_secs(3));
+        // 0x0D rejected, 0x07 used and remembered.
+        let k800 = profiles.get(0x2010).expect("K800 profile");
+        assert_eq!(k800.battery_register, Some(0x07));
+        assert_eq!(k800.name, K800_NAME);
+        // Battery notifications switched on in the device itself.
+        assert_eq!(sim.register(4, 0x00), Some([0x10, 0x00, 0x00]));
+        // The 2.0 mouse never sees a register read.
+        assert_eq!(register_requests(&sim.writes_to(Collection::Short, 1)), 0);
+    }
+
+    #[test]
+    fn battery_charge_register_wins_when_present() {
+        let device = hidpp10(
+            &[(0x0D, [0x55, 0x00, 0x30]), (0x07, [0x07, 0x00, 0x00])],
+            ErrorRoute::Short,
+        );
+        let sim = SimReceiver::new().with(2, device);
+        let mut profiles = DeviceProfiles::default();
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+
+        assert_eq!(summary(&result), [(2, K800_NAME, 85, false)]);
+        assert_eq!(profiles.get(0x2010).unwrap().battery_register, Some(0x0D));
+        assert_eq!(
+            register_reads(&sim.writes_to(Collection::Short, 2), 0x07),
+            0
+        );
+    }
+
+    #[test]
+    fn warm_start_reads_the_remembered_register_directly() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x07, 0x00, 0x00]));
+        let mut profiles = DeviceProfiles::default();
+        poll(&sim, short_link(&sim), &mut profiles);
+        let before = sim.writes().len();
+
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+        assert_eq!(summary(&result), [(4, K800_NAME, 90, false)]);
+        let new_writes = sim.writes().split_off(before);
+        // No ping, no enumeration: the first thing sent to slot 4 is the read.
+        assert!(!new_writes
+            .iter()
+            .any(|(c, w)| *c == Collection::Long && w[1] == 4));
+        let first = new_writes.iter().find(|(_, w)| w[1] == 4).unwrap();
+        assert_eq!(first.1, [0x10, 4, 0x81, 0x07, 0, 0, 0]);
+    }
+
+    #[test]
+    fn stale_register_profile_is_resolved_again() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x03, 0x00, 0x00]));
+        let mut profiles = DeviceProfiles::default();
+        profiles.upsert(
+            0x2010,
+            BatterySource::Register(0x0D).to_profile("old".into()),
+        );
+
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+        assert_eq!(summary(&result), [(4, K800_NAME, 20, false)]);
+        assert_eq!(profiles.get(0x2010).unwrap().battery_register, Some(0x07));
+    }
+
+    #[test]
+    fn k800_is_found_by_its_ping_whatever_it_does_with_long_requests() {
+        // Where a 1.0 device's rejection of a *long* 2.0 request lands is
+        // unknown; detection uses a short ping, so it must not matter.
+        for route in [ErrorRoute::Short, ErrorRoute::Long, ErrorRoute::Silent] {
+            let device = hidpp10(&[(0x07, [0x05, 0x00, 0x00])], route);
+            let sim = SimReceiver::new().with(4, device);
+            let start = Instant::now();
+            let result = poll(&sim, short_link(&sim), &mut DeviceProfiles::default());
+
+            assert_eq!(summary(&result), [(4, K800_NAME, 50, false)], "{route:?}");
+            assert!(sim.writes_to(Collection::Long, 4).is_empty(), "{route:?}");
+            assert!(start.elapsed() < Duration::from_secs(1), "{route:?}");
+        }
+    }
+
+    #[test]
+    fn k800_charging_without_a_level_is_kept_until_it_reports_one() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x00, 0x21, 0x00]));
+        let mut profiles = DeviceProfiles::default();
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+        // Not shown, but resolved and remembered: no level is not a stale profile.
+        assert!(result.devices.is_empty());
+        assert_eq!(result.errors.len(), 1, "{:?}", result.errors);
+        assert_eq!(profiles.get(0x2010).unwrap().battery_register, Some(0x07));
+
+        let before = sim.writes().len();
+        sim.set_register(4, 0x07, [0x05, 0x21, 0x00]);
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+        assert_eq!(summary(&result), [(4, K800_NAME, 50, true)]);
+        // Straight from the profile: no new protocol ping.
+        let pings = sim.writes().split_off(before);
+        assert!(!pings.iter().any(|(_, w)| w[1] == 4 && w[2] == 0x00));
+    }
+
+    #[test]
+    fn empty_k800_reads_as_zero() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x00, 0x00, 0x00]));
+        let result = poll(&sim, short_link(&sim), &mut DeviceProfiles::default());
+        assert_eq!(summary(&result), [(4, K800_NAME, 0, false)]);
+    }
+
+    #[test]
+    fn asleep_k800_fails_fast_and_keeps_its_profile() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x07, 0x00, 0x00]));
+        let mut profiles = DeviceProfiles::default();
+        poll(&sim, short_link(&sim), &mut profiles);
+        let before = sim.writes().len();
+
+        sim.set_reachable(4, false);
+        let start = Instant::now();
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+        assert!(result.devices.is_empty());
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert_eq!(profiles.get(0x2010).unwrap().battery_register, Some(0x07));
+        // No re-detection or enumeration for an asleep device.
+        let writes = sim.writes().split_off(before);
+        assert!(!writes
+            .iter()
+            .any(|(c, w)| w[1] == 4 && (*c == Collection::Long || w[2] == 0x00)));
+
+        sim.set_reachable(4, true);
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+        assert_eq!(summary(&result), [(4, K800_NAME, 90, false)]);
+    }
+
+    #[test]
+    fn asleep_mouse_fails_fast_without_enumeration_or_register_reads() {
+        let sim = SimReceiver::new().with(1, SimDevice::g502(68));
+        sim.set_reachable(1, false);
+        let start = Instant::now();
+        let result = poll(&sim, short_link(&sim), &mut DeviceProfiles::default());
+
+        assert!(result.devices.is_empty());
+        assert!(
+            result.errors[0].contains("not available"),
+            "{:?}",
+            result.errors
+        );
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(sim.writes_to(Collection::Long, 1).is_empty());
+        assert_eq!(register_requests(&sim.writes_to(Collection::Short, 1)), 0);
+    }
+
+    #[test]
+    fn mouse_that_answered_its_ping_never_gets_a_register_probe() {
+        let mouse = SimDevice::Hidpp20 {
+            wpid: 0x4099,
+            name: "G502 X PLUS",
+            battery_percent: 68,
+            flaky_first: 0,
+            broken_features: true,
+            replies_short: false,
+        };
+        let sim = SimReceiver::new().with(1, mouse);
+        let mut profiles = DeviceProfiles::default();
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+
+        assert!(result.devices.is_empty());
+        assert_eq!(result.errors.len(), 1);
+        assert_eq!(register_requests(&sim.writes_to(Collection::Short, 1)), 0);
+        assert!(profiles.get(0x4099).is_none());
+    }
+
+    #[test]
+    fn k800_that_takes_one_request_at_a_time_still_reads() {
+        // With a slow link, a request sent before the previous answer arrived
+        // is refused as busy; the notification setup must wait for its ack.
+        let sim = SimReceiver::new()
+            .with_latency(Duration::from_millis(30))
+            .with(4, SimDevice::k800([0x05, 0x00, 0x00]));
+        let result = poll(&sim, short_link(&sim), &mut DeviceProfiles::default());
+        assert_eq!(
+            summary(&result),
+            [(4, K800_NAME, 50, false)],
+            "{:?}",
+            result.errors
+        );
+        assert_eq!(sim.register(4, 0x00), Some([0x10, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn late_register_reply_is_not_taken_for_the_next_read() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x07, 0x00, 0x00]));
+        let mut short = ShortLink::new(sim.link(Collection::Short));
+        // The reply misses the read's window and arrives just after it.
+        sim.delay_next_reply(4, Duration::from_millis(DEVICE_REQUEST_TIMEOUT_MS + 100));
+        assert!(short.read_register(4, 0x07).is_err());
+
+        sim.set_register(4, 0x07, [0x03, 0x00, 0x00]);
+        thread::sleep(Duration::from_millis(200));
+        assert_eq!(short.read_register(4, 0x07).unwrap(), [0x03, 0x00, 0x00]);
+    }
+
+    #[test]
+    fn slow_k800_is_detected_and_read_without_resends() {
+        // 750 ms answers: a resend would arrive while the device is busy.
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x05, 0x00, 0x00]));
+        sim.delay_next_reply(4, Duration::from_millis(750));
+        let start = Instant::now();
+        let result = poll(&sim, short_link(&sim), &mut DeviceProfiles::default());
+        assert_eq!(
+            summary(&result),
+            [(4, K800_NAME, 50, false)],
+            "{:?}",
+            result.errors
+        );
+        // Detected by its (slow) ping answer, so no enumeration.
+        assert!(sim.writes_to(Collection::Long, 4).is_empty());
+        assert!(start.elapsed() < Duration::from_secs(2));
+
+        let mut short = ShortLink::new(sim.link(Collection::Short));
+        sim.delay_next_reply(4, Duration::from_millis(750));
+        assert_eq!(short.read_register(4, 0x07).unwrap(), [0x05, 0x00, 0x00]);
+        assert_eq!(
+            register_reads(&sim.writes_to(Collection::Short, 4), 0x07),
+            3
+        );
+    }
+
+    #[test]
+    fn full_k800_without_a_level_reads_as_full() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x00, 0x22, 0x00]));
+        let result = poll(&sim, short_link(&sim), &mut DeviceProfiles::default());
+        assert_eq!(summary(&result), [(4, K800_NAME, 100, false)]);
+    }
+
+    #[test]
+    fn mouse_answering_its_ping_short_is_still_hidpp20() {
+        let mouse = SimDevice::Hidpp20 {
+            wpid: 0x4099,
+            name: "G502 X PLUS",
+            battery_percent: 68,
+            flaky_first: 0,
+            broken_features: false,
+            replies_short: true,
+        };
+        let sim = SimReceiver::new().with(1, mouse);
+        let mut long = sim.link(Collection::Long);
+        let mut short = ShortLink::new(sim.link(Collection::Short));
+        let start = Instant::now();
+        assert_eq!(
+            detect_protocol(&mut *long, &mut short, 1),
+            SlotProtocol::Hidpp20
+        );
+        assert!(start.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn busy_k800_does_not_settle_on_the_coarse_register() {
+        let device = hidpp10(
+            &[(0x0D, [0x55, 0x00, 0x30]), (0x07, [0x07, 0x00, 0x00])],
+            ErrorRoute::Short,
+        );
+        let sim = SimReceiver::new().with(4, device);
+        let mut profiles = DeviceProfiles::default();
+        // The 0x0D probe is refused as busy: nothing is learned or remembered.
+        sim.reject_next_register(4, receiver::ERR_BUSY);
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+        assert!(result.devices.is_empty());
+        assert!(profiles.get(0x2010).is_none());
+
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+        assert_eq!(summary(&result), [(4, K800_NAME, 85, false)]);
+        assert_eq!(profiles.get(0x2010).unwrap().battery_register, Some(0x0D));
+    }
+
+    #[test]
+    fn full_backlog_keeps_the_newest_reports() {
+        let mut backlog = VecDeque::new();
+        for i in 0..SHORT_BACKLOG_CAP + 2 {
+            push_bounded(&mut backlog, [0x10, 1, 0x41, 0, 0, 0, i as u8]);
+        }
+        assert_eq!(backlog.len(), SHORT_BACKLOG_CAP);
+        assert_eq!(backlog.front().unwrap()[6], 2);
+        assert_eq!(backlog.back().unwrap()[6], (SHORT_BACKLOG_CAP + 1) as u8);
+    }
+
+    #[test]
+    fn one_ping_tells_the_protocols_apart() {
+        let sim = SimReceiver::new()
+            .with(1, SimDevice::g502(68))
+            .with(4, SimDevice::k800([0x07, 0x00, 0x00]));
+        let mut long = sim.link(Collection::Long);
+        let mut short = ShortLink::new(sim.link(Collection::Short));
+        assert_eq!(
+            detect_protocol(&mut *long, &mut short, 1),
+            SlotProtocol::Hidpp20
+        );
+        assert_eq!(
+            detect_protocol(&mut *long, &mut short, 4),
+            SlotProtocol::Hidpp10
+        );
+        assert_eq!(
+            detect_protocol(&mut *long, &mut short, 3),
+            SlotProtocol::Absent
+        );
+    }
+
+    #[test]
+    fn mouse_missing_its_pings_is_still_read_as_hidpp20() {
+        let mouse = SimDevice::Hidpp20 {
+            wpid: 0x4099,
+            name: "G502 X PLUS",
+            battery_percent: 68,
+            flaky_first: PING_RETRIES,
+            broken_features: false,
+            replies_short: false,
+        };
+        let sim = SimReceiver::new().with(1, mouse);
+        let mut profiles = DeviceProfiles::default();
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+
+        assert_eq!(summary(&result), [(1, "G502 X PLUS", 68, false)]);
+        assert_eq!(profiles.get(0x4099).unwrap().battery_register, None);
+        assert_eq!(register_requests(&sim.writes_to(Collection::Short, 1)), 0);
+    }
+
+    #[test]
+    #[ignore = "slow: waits out the ping and enumeration timeouts (~15 s)"]
+    fn unresponsive_mouse_is_never_taken_for_a_register_device() {
+        let mouse = SimDevice::Hidpp20 {
+            wpid: 0x4099,
+            name: "G502 X PLUS",
+            battery_percent: 68,
+            flaky_first: usize::MAX,
+            broken_features: false,
+            replies_short: false,
+        };
+        let sim = SimReceiver::new().with(1, mouse);
+        let mut profiles = DeviceProfiles::default();
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+
+        assert!(result.devices.is_empty());
+        assert_eq!(result.errors.len(), 1);
+        assert!(profiles.get(0x4099).is_none());
+    }
+
+    #[test]
+    fn without_a_short_collection_the_mouse_still_reads() {
+        let sim = SimReceiver::new()
+            .with(1, SimDevice::g502(68))
+            .with(4, SimDevice::k800([0x07, 0x00, 0x00]));
+        let result = poll(&sim, None, &mut DeviceProfiles::default());
+        // The K800 cannot be reached without the short collection; the mouse
+        // must not suffer for it.
+        assert_eq!(summary(&result), [(1, "G502 X PLUS", 68, false)]);
     }
 
     /// A worker thread on the simulator; sends Exit and joins on drop.
@@ -1398,9 +2435,288 @@ mod sim_tests {
     }
 
     #[test]
+    fn worker_keeps_the_mouse_announcement_that_lands_during_k800_reads() {
+        // Announcements go out by slot, so the mouse's 0x41 is already queued
+        // on the short collection while the K800's registers are read there.
+        let sim = SimReceiver::new()
+            .with(1, SimDevice::k800([0x05, 0x00, 0x00]))
+            .with(2, SimDevice::g502(68));
+        let worker = Worker::start(&sim);
+        let mut seen = BTreeSet::new();
+        while seen.len() < 2 {
+            if let DeviceEvent::Update(state) = worker.next() {
+                seen.insert((state.device_index, state.battery_percent));
+            }
+        }
+        assert_eq!(seen, BTreeSet::from([(1, 50), (2, 68)]));
+    }
+
+    #[test]
+    fn worker_rereads_a_k800_that_pushes_a_battery_change() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x07, 0x00, 0x00]));
+        let worker = Worker::start(&sim);
+        assert_eq!(worker.update_for(4).battery_percent, 90);
+
+        assert!(sim.battery_change(4, [0x03, 0x21, 0x00]));
+        let state = worker.update_for(4);
+        assert_eq!((state.battery_percent, state.is_charging), (20, true));
+    }
+
+    #[test]
+    fn worker_reports_a_k800_link_down() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x07, 0x00, 0x00]));
+        let worker = Worker::start(&sim);
+        let state = worker.update_for(4);
+
+        sim.push(Collection::Short, &[0x10, 4, 0x41, 0x04, 0x41, 0x10, 0x20]);
+        loop {
+            if let DeviceEvent::Gone(key) = worker.next() {
+                assert_eq!(key, state.device_key);
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn worker_shows_a_charging_k800_once_it_pushes_a_level() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x00, 0x21, 0x00]));
+        let worker = Worker::start(&sim);
+        // Nothing to show yet, but the slot must stay known for its pushes.
+        assert!(worker
+            .events
+            .recv_timeout(Duration::from_millis(500))
+            .is_err());
+
+        // Docked with no level, but its notifications were switched on: the
+        // push only arrives because of that.
+        assert!(sim.battery_change(4, [0x05, 0x21, 0x00]));
+        let state = worker.update_for(4);
+        assert_eq!((state.battery_percent, state.is_charging), (50, true));
+
+        // A charging push without a level keeps the last one shown.
+        assert!(sim.battery_change(4, [0x00, 0x21, 0x00]));
+        assert_eq!(worker.update_for(4).battery_percent, 50);
+    }
+
+    #[test]
+    fn worker_ignores_short_events_from_hidpp20_devices() {
+        // Feature index 7 on the short collection looks like a 1.0 battery push.
+        let sim = SimReceiver::new().with(1, SimDevice::g502(68));
+        let worker = Worker::start(&sim);
+        worker.update_for(1);
+        let before = sim.writes_to(Collection::Long, 1).len();
+
+        sim.push(Collection::Short, &[0x10, 1, 0x07, 0x00, 0x00, 0x00, 0x00]);
+        assert!(worker
+            .events
+            .recv_timeout(Duration::from_millis(1500))
+            .is_err());
+        assert_eq!(sim.writes_to(Collection::Long, 1).len(), before);
+    }
+
+    fn k800_profile() -> DeviceProfiles {
+        let mut profiles = DeviceProfiles::default();
+        profiles.upsert(
+            0x2010,
+            BatterySource::Register(0x07).to_profile(K800_NAME.into()),
+        );
+        profiles
+    }
+
+    /// A battery change the device must push (its notifications are on).
+    fn push_battery(sim: &SimReceiver, slot: u8, value: [u8; 3]) {
+        assert!(sim.battery_change(slot, value), "notifications are off");
+    }
+
+    #[test]
+    fn worker_shows_a_charged_k800_as_full() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x01, 0x00, 0x00]));
+        let worker = Worker::start(&sim);
+        assert_eq!(worker.update_for(4).battery_percent, 5);
+
+        push_battery(&sim, 4, [0x00, 0x21, 0x00]);
+        let state = worker.update_for(4);
+        assert_eq!((state.battery_percent, state.is_charging), (5, true));
+
+        push_battery(&sim, 4, [0x00, 0x22, 0x00]);
+        let state = worker.update_for(4);
+        assert_eq!((state.battery_percent, state.is_charging), (100, false));
+    }
+
+    #[test]
+    fn worker_does_not_reuse_a_level_once_the_charge_ended() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x05, 0x00, 0x00]));
+        let worker = Worker::start(&sim);
+        assert_eq!(worker.update_for(4).battery_percent, 50);
+
+        // A level code we do not understand, not charging: show nothing new
+        // rather than the old level.
+        push_battery(&sim, 4, [0x04, 0x00, 0x00]);
+        assert!(worker
+            .events
+            .recv_timeout(Duration::from_millis(500))
+            .is_err());
+        // The pushes are being handled: a readable level shows up again.
+        push_battery(&sim, 4, [0x03, 0x00, 0x00]);
+        assert_eq!(worker.update_for(4).battery_percent, 20);
+    }
+
+    #[test]
+    fn docked_k800_without_a_level_still_gets_its_notifications_on() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x00, 0x21, 0x00]));
+        let result = poll(&sim, short_link(&sim), &mut DeviceProfiles::default());
+        assert!(result.devices.is_empty());
+        assert_eq!(sim.register(4, 0x00), Some([0x10, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn worker_stops_asking_a_k800_without_a_notification_register() {
+        let sim =
+            SimReceiver::new().with(4, hidpp10(&[(0x07, [0x07, 0x00, 0x00])], ErrorRoute::Short));
+        // This one has no register 0x00 at all.
+        sim.remove_register(4, 0x00);
+        let worker = Worker::start(&sim);
+        worker.update_for(4);
+        worker.cmd.send(WorkerCommand::Refresh).unwrap();
+        worker.update_for(4);
+        let asked = register_reads(&sim.writes_to(Collection::Short, 4), 0x00);
+        assert_eq!(asked, 1);
+    }
+
+    #[test]
+    fn worker_does_not_re_resolve_a_failing_mouse_on_its_short_events() {
+        let mouse = SimDevice::Hidpp20 {
+            wpid: 0x4099,
+            name: "G502 X PLUS",
+            battery_percent: 68,
+            flaky_first: 0,
+            broken_features: true,
+            replies_short: false,
+        };
+        let sim = SimReceiver::new().with(1, mouse);
+        let worker = Worker::start(&sim);
+        assert!(worker
+            .events
+            .recv_timeout(Duration::from_millis(500))
+            .is_err());
+        let before = sim.writes().len();
+
+        sim.push(Collection::Short, &[0x10, 1, 0x07, 0x00, 0x00, 0x00, 0x00]);
+        thread::sleep(Duration::from_millis(1000));
+        assert_eq!(sim.writes().len(), before);
+    }
+
+    #[test]
+    fn k800_busy_at_its_ping_skips_enumeration() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x07, 0x00, 0x00]));
+        sim.reject_next_ping(4, receiver::ERR_BUSY);
+        let start = Instant::now();
+        let result = poll(&sim, short_link(&sim), &mut DeviceProfiles::default());
+        assert!(
+            result.errors[0].contains("not available"),
+            "{:?}",
+            result.errors
+        );
+        assert!(start.elapsed() < Duration::from_millis(500));
+        assert!(sim.writes_to(Collection::Long, 4).is_empty());
+
+        let result = poll(&sim, short_link(&sim), &mut DeviceProfiles::default());
+        assert_eq!(summary(&result), [(4, K800_NAME, 90, false)]);
+    }
+
+    #[test]
+    fn worker_reenables_k800_notifications_on_warm_start_and_reconnect() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x07, 0x00, 0x00]));
+        let worker = Worker::start_with(&sim, k800_profile(), true, 60);
+        worker.update_for(4);
+        assert_eq!(sim.register(4, 0x00), Some([0x10, 0x00, 0x00]));
+        // Warm: straight from the profile, no protocol ping.
+        assert!(!sim
+            .writes_to(Collection::Short, 4)
+            .iter()
+            .any(|w| w[2] == 0x00));
+
+        // Power cycle: link down, the device forgets its flags, link up.
+        sim.push(Collection::Short, &[0x10, 4, 0x41, 0x04, 0x41, 0x10, 0x20]);
+        while !matches!(worker.next(), DeviceEvent::Gone(_)) {}
+        sim.set_register(4, 0x00, [0x00, 0x00, 0x00]);
+        sim.push(Collection::Short, &[0x10, 4, 0x41, 0x04, 0x01, 0x10, 0x20]);
+        worker.update_for(4);
+        assert_eq!(sim.register(4, 0x00), Some([0x10, 0x00, 0x00]));
+    }
+
+    #[test]
+    fn worker_picks_up_a_k800_that_was_asleep_at_a_warm_start() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x07, 0x00, 0x00]));
+        // Its notifications are still on from an earlier session.
+        sim.set_register(4, 0x00, [0x10, 0x00, 0x00]);
+        sim.set_reachable(4, false);
+        let worker = Worker::start_with(&sim, k800_profile(), true, 60);
+        assert!(worker
+            .events
+            .recv_timeout(Duration::from_millis(500))
+            .is_err());
+
+        sim.set_reachable(4, true);
+        push_battery(&sim, 4, [0x05, 0x00, 0x00]);
+        assert_eq!(worker.update_for(4).battery_percent, 50);
+    }
+
+    #[test]
+    fn worker_picks_up_a_k800_that_was_asleep_at_a_cold_start() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x07, 0x00, 0x00]));
+        // Its notifications are still on from an earlier session (it has not
+        // powered off since); without them it cannot push and only the next
+        // announcement picks it up.
+        sim.set_register(4, 0x00, [0x10, 0x00, 0x00]);
+        sim.set_reachable(4, false);
+        let worker = Worker::start(&sim);
+        assert!(worker
+            .events
+            .recv_timeout(Duration::from_millis(500))
+            .is_err());
+
+        sim.set_reachable(4, true);
+        push_battery(&sim, 4, [0x03, 0x00, 0x00]);
+        let state = worker.update_for(4);
+        assert_eq!(
+            (state.display_name.as_str(), state.battery_percent),
+            (K800_NAME, 20)
+        );
+    }
+
+    #[test]
     fn worker_without_a_short_collection_finds_the_mouse() {
         let sim = SimReceiver::new().with(1, SimDevice::g502(68));
         let worker = Worker::start_with(&sim, DeviceProfiles::default(), false, 60);
         assert_eq!(worker.update_for(1).battery_percent, 68);
+    }
+
+    #[test]
+    #[ignore = "slow: waits for the 15 s minimum safety interval"]
+    fn worker_safety_tick_rereads_a_k800() {
+        let sim = SimReceiver::new().with(4, SimDevice::k800([0x07, 0x00, 0x00]));
+        let worker = Worker::start_with(&sim, DeviceProfiles::default(), true, MIN_SAFETY_SECS);
+        assert_eq!(worker.update_for(4).battery_percent, 90);
+
+        // A change the device does not push: only the safety re-read sees it.
+        sim.set_register(4, 0x07, [0x03, 0x00, 0x00]);
+        let deadline = Instant::now() + Duration::from_secs(MIN_SAFETY_SECS + 5);
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            match worker.events.recv_timeout(remaining) {
+                Ok(DeviceEvent::Update(state)) if state.battery_percent == 20 => break,
+                Ok(_) => {}
+                Err(err) => panic!("no safety re-read: {err}"),
+            }
+        }
+        // The receiver's flags were re-asserted by the tick (once at start).
+        let flags = receiver::notification_flags();
+        let flag_writes = sim
+            .writes_to(Collection::Short, 0xFF)
+            .iter()
+            .filter(|w| w[2] == 0x80 && w[3] == 0x00 && w[4..7] == flags)
+            .count();
+        assert!(flag_writes >= 2, "{flag_writes}");
     }
 }
