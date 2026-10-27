@@ -4,13 +4,18 @@
 //!   1. which VID 0x046D HID interfaces hidapi enumerates (usage page / interface)
 //!   2. what `scan_receivers` actually matches
 //!   3. whether each 0xFF00 interface answers a HID++ ping on indices 1..=6
+//!
+//! It then listens for receiver notifications, and finally probes each slot's
+//! HID++ 1.0 battery registers and a 2.0 ping, printing which collection every
+//! answer arrives on (the data a HID++ 1.0 device report needs).
 
 use crate::hid::protocol::{self, ping, READ_TIMEOUT_MS, SHORT_REPORT_ID};
 use crate::hid::receiver;
 use crate::hid::scanner::{
     open_notifier, open_receiver, scan_receivers, ReceiverPath, LOGITECH_VID,
 };
-use hidapi::HidApi;
+use hidapi::{HidApi, HidDevice};
+use std::time::Instant;
 
 const HIDPP_USAGE_PAGE: u16 = 0xFF00;
 
@@ -155,6 +160,127 @@ pub fn run_diag() {
     }
 
     notification_probe(&api, &receivers);
+    register_probe(&api, &receivers);
+}
+
+/// How long [`register_probe`] listens for answers to one request.
+const PROBE_LISTEN_MS: u128 = 1000;
+
+/// Probe how each slot answers HID++ 1.0 battery register reads (sent short on
+/// the short collection) and a HID++ 2.0 ping (sent long on the long
+/// collection), listening on **both** collections and printing where each
+/// answer lands and how long it took. HID++ 1.0 devices such as the original
+/// K800 are read through these registers; the routing of their replies and
+/// errors is exactly what this records. All requests are reads.
+fn register_probe(api: &HidApi, receivers: &[ReceiverPath]) {
+    println!("\n=== Register probe (HID++ 1.0 battery registers + 2.0 ping, both collections) ===");
+    for recv in receivers {
+        println!("\n-- PID {:04X}", recv.pid);
+        let short = match open_notifier(api, recv) {
+            Ok(dev) => dev,
+            Err(err) => {
+                println!("   {err}");
+                continue;
+            }
+        };
+        let long = match open_receiver(api, recv) {
+            Ok(dev) => dev,
+            Err(err) => {
+                println!("   {err}");
+                continue;
+            }
+        };
+        for slot in 1u8..=6 {
+            for register in receiver::BATTERY_REGISTERS {
+                let request = receiver::device_register_read(slot, register);
+                probe_request(
+                    &format!("index {slot} GET register 0x{register:02X} (short)"),
+                    &short,
+                    &long,
+                    &short,
+                    &request,
+                    slot,
+                );
+            }
+            let echo = 0x55 ^ slot;
+            let request = ping(slot, echo).encode_long();
+            probe_request(
+                &format!("index {slot} 2.0 ping (long)"),
+                &short,
+                &long,
+                &long,
+                &request,
+                slot,
+            );
+            // Solaar pings with a short report; this is how it tells a HID++
+            // 1.0 device (error 0x01) from a 2.0 one.
+            let request = ping(slot, echo).encode();
+            probe_request(
+                &format!("index {slot} 2.0 ping (short)"),
+                &short,
+                &long,
+                &short,
+                &request,
+                slot,
+            );
+        }
+    }
+}
+
+/// Write `request` to `target`, then listen on both collections until a report
+/// addressed to `slot` arrives (plus a short grace period for stragglers) or
+/// [`PROBE_LISTEN_MS`] passes.
+fn probe_request(
+    label: &str,
+    short: &HidDevice,
+    long: &HidDevice,
+    target: &HidDevice,
+    request: &[u8],
+    slot: u8,
+) {
+    println!("   {label}: {}", hex(request));
+    // Drop anything already queued so it is not mistaken for an answer.
+    for handle in [short, long] {
+        let mut buf = [0u8; 21];
+        while matches!(handle.read_timeout(&mut buf, 0), Ok(n) if n > 0) {}
+    }
+    if let Err(err) = target.write(request) {
+        println!("      write failed: {err}");
+        return;
+    }
+    let start = Instant::now();
+    let mut answered_at = None;
+    loop {
+        let elapsed = start.elapsed().as_millis();
+        if elapsed >= PROBE_LISTEN_MS || answered_at.is_some_and(|t| elapsed >= t + 150) {
+            break;
+        }
+        for (name, handle) in [("short", short), ("long", long)] {
+            let mut buf = [0u8; 21];
+            match handle.read_timeout(&mut buf, 10) {
+                Ok(n) if n > 0 => {
+                    let ms = start.elapsed().as_millis();
+                    println!("      [{name}] +{ms} ms  {}", hex(&buf[..n]));
+                    if protocol::normalize_report(&buf, n).is_some_and(|r| r[1] == slot) {
+                        answered_at.get_or_insert(ms);
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => println!("      [{name}] read failed: {err}"),
+            }
+        }
+    }
+    if answered_at.is_none() {
+        println!("      no answer for index {slot} within {PROBE_LISTEN_MS} ms");
+    }
+}
+
+fn hex(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Probe the receiver's short collection (usage 0x0001), where HID++ 1.0
