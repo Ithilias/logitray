@@ -1,134 +1,82 @@
 # logitray
 
-A tiny Windows tray app that shows the battery level of your wireless Logitech devices and warns you before they die. No Logitech G HUB or Options+ required.
+A tiny Windows tray app that shows the battery level of your wireless Logitech devices and warns you before they run out. No G HUB or Options+ required.
 
-## What it does
+- Battery for every paired mouse, keyboard, or trackball, as a color-coded glyph or a plain percentage
+- Low-battery notifications for any device, with a per-device cooldown so they don't nag
+- Updates within about a second: the receiver pushes battery, charging, and connect events, so there is no busy polling
+- One portable exe: no installer, no admin rights, no Logitech software
+- English and Simplified Chinese
 
-logitray sits in your system tray and talks to your Logitech wireless devices directly over the HID++ protocol through their USB receiver. It listens for the receiver's notifications, so battery, charging, and connect/disconnect changes show up on the tray icon within about a second (with a periodic re-read as a backstop), and it pops a Windows notification when a battery gets low. All of it works without any Logitech software running.
-
-## Features
-
-- Live battery level for any wireless Logitech device (mouse, keyboard, trackball), right in the system tray
-- Two view modes: a color-coded **battery glyph**, or the **percentage as text** — switch any time from the menu
-- Color coding: green (healthy), orange (low), red (critical), blue (charging)
-- Hover the icon for each device's name and exact percentage, one per line, trimmed to a `+N more` marker if they do not all fit
-- Automatic low-battery notifications, with a cooldown so they don't spam you
-- Multiple devices: every paired device is monitored and alerted on; pick which one the tray icon follows
-- Manual "Refresh now" any time
-- Optional autostart with Windows
-- Optional daily check for new releases on GitHub (notify only)
-- Event-driven: connect, disconnect, charging, and battery-level changes are pushed by the receiver and reflected within ~1s — no busy polling, near-zero idle USB traffic, with a periodic re-read as a backstop
-
-## Install & run
+## Install
 
 1. Download `logitray.exe` from the [latest release](https://github.com/Ithilias/logitray/releases/latest).
-2. Put it anywhere you like and double-click it — it appears in the system tray (check the `^` overflow if you don't see it).
-3. (Optional) From a terminal, run `logitray.exe --once` to print the current battery level and confirm your device is detected.
+2. Put it anywhere and run it. The icon appears in the system tray (check the `^` overflow if you don't see it).
+3. Optional: enable **Start at login** from the tray menu.
 
-No installer, no admin rights, no Logitech software needed. logitray does not start with Windows unless you enable **Start at login** from the tray menu.
+To confirm your device is detected, run `logitray.exe --once` in a terminal. It prints the current battery levels.
 
-## In the tray
+## Using it
 
-Right-click the icon for the menu:
+Hover the icon to see each device's name and battery. Right-click for the menu: the status line, **Select Device**, **Refresh now**, and the settings below.
 
-- **Status line** — the device the icon follows and its battery (e.g. `G502 X Plus: 76%`)
-- **Select Device** — **Automatic (lowest battery)**, the default, or a specific device to pin the icon to (see Which device the icon follows below)
-- **Refresh now** — re-check all devices immediately instead of waiting for the backstop re-read
-- **Show percentage as text** — toggle between the battery-glyph icon and the percentage-number icon
-- **Language** — Automatic (Windows language), English, or 简体中文
-- **Poll interval** — how often to re-read all devices as a backstop (15 seconds to 15 minutes; battery changes are pushed, so this only bounds the fallback)
-- **Enable low-battery notifications** — toggle the Windows toast
-- **Low battery alert at** — the percentage (5% to 30%) at or below which the toast fires
-- **Reminder interval** — minimum time between repeat alerts per device (30 minutes to 8 hours)
-- **Start at login** — register/unregister autostart with Windows
-- **Check for updates automatically** — toggle the startup and daily check for new releases on GitHub (see Update check below)
-- **Open config file…** — open `config.toml` in the default editor
-- **Exit**
+The icon is **green** when healthy, **orange** when getting low, **red** at or below the alert threshold, and **blue** while charging.
 
-Icon colors follow the low-battery threshold, so the icon turns red exactly when a toast would fire: **red** at or below the threshold, **orange** from there up to 20 points above it (never below 35%), **green** above that, **blue** while charging. At the default threshold of 15% that reads green ≥ 36%, orange 16–35%, red ≤ 15%. Raise the threshold to 30% and 50% is orange, with green starting at 51%.
+<details>
+<summary>How the color thresholds are chosen</summary>
 
-## Which device the icon follows
+Red starts at the low-battery threshold, so the icon turns red exactly when a notification would fire. Orange covers the 20 points above it (never less than 35%), green everything higher. At the default threshold of 15% that is green at 36% and up, orange from 16 to 35%, red at 15% and below. With a threshold of 30%, green starts at 51%.
 
-By default the tray follows **Automatic (lowest battery)**: the icon and status line show whichever connected device is closest to running out, so one glance answers "is anything about to die?". With a single device this is exactly the same as following that device. To pin the icon to one device instead, choose it from **Select Device**.
+</details>
 
-Automatic passes over devices that are charging, so a mouse resting on its cable does not take the icon from a keyboard that is actually running low. If every device is charging, the lowest of them is shown. It also only hands the icon over once another device is at least 5 points lower, so two devices sitting at similar levels do not make it flip back and forth. That margin does not apply across the low-battery threshold: a device that drops to it takes the icon straight away, so the icon is never showing a healthy device while a different one is low enough to be alerting.
+### Which device the icon follows
 
-The tooltip lists the other devices either way, trimming the tail to a `+N more` marker when they do not all fit. In `text` view mode the icon is a bare number with no name attached, so under Automatic the tooltip or the status line is what tells you which device it belongs to.
+By default the icon follows **Automatic (lowest battery)**: whichever connected device is closest to running out, so one glance tells you whether anything is about to die. To pin the icon to one device instead, pick it under **Select Device**. Low-battery alerts cover every device either way.
 
-## Language
+<details>
+<summary>How Automatic picks a device</summary>
 
-The tray menu, tooltips, and battery notifications support English and Simplified Chinese.
-By default, logitray detects the Windows display language at startup. Simplified Chinese
-(Mainland China and Singapore) selects Chinese; unsupported languages, including
-Traditional Chinese, fall back to English.
+- Devices that are charging are skipped, so a mouse on its cable doesn't hide a keyboard that is running low. If everything is charging, the lowest of them is shown.
+- Another device only takes over the icon once it is at least 5 points lower, so two devices at similar levels don't flip back and forth.
+- That margin doesn't apply at the alert threshold: a device that drops to it takes the icon right away.
+- In text view the icon is a bare number, so the tooltip or status line tells you which device it belongs to.
 
-Choose **Language → Automatic (Windows language)**, **English**, or **简体中文** in the
-tray menu. Changes apply immediately and are saved. Choosing Automatic reads the current
-Windows display language again. Device names remain as reported by the device.
-CLI diagnostics and logs remain in English.
-
-## Low-battery alerts
-
-When **any** device drops to or below the threshold (15% by default), logitray shows a Windows toast. Alerts are not limited to the device the tray icon follows: every paired device is checked, whichever one the menu is pointed at. To avoid nagging, it waits out a cooldown (120 minutes by default) before alerting again, tracked separately for each device.
-
-## Update check
-
-By default, logitray checks about a minute after startup and then once a day whether a newer release exists. The check is a single request to the GitHub releases page that reads the latest tag from the redirect. GitHub receives your IP address and the app version (user agent `logitray/<version>`); no identifiers or device data are sent. A failed check, for example because the network is not up yet, is retried after ten minutes. When a newer release exists, a toast appears once per new version and an **Update available** entry is added to the tray menu; clicking either opens the release page in your browser. Nothing is downloaded or installed automatically.
-
-Turn the check off with **Check for updates automatically** in the tray menu or `check_for_updates = false` in the config. Turning it back on checks right away.
-
-## Supported devices
-
-Any Logitech wireless device that speaks **HID++ 2.0** through a Logitech **Unifying**, **LIGHTSPEED**, or **Bolt** USB receiver: mice, keyboards, trackballs, and so on. Up to six paired devices per receiver are tracked. Devices report their own marketing name over HID++, so there's no large hardcoded device database to maintain. The name you see is the one your device reports. Battery is read via feature `0x1000`, `0x1001` (voltage, converted with a lookup table), or `0x1004`, whichever the device supports.
-
-Older devices that only speak **HID++ 1.0** (for example the original K800 keyboard on a Unifying receiver) are read through their battery registers instead, the way [Solaar](https://github.com/pwr-Solaar/Solaar) does. Most of them only report a coarse level, shown as 90, 50, 20 or 5%. They cannot report their name, so a small built-in table names the ones we know.
-
-Tested against a **G502 X PLUS** over a LIGHTSPEED receiver. Other device classes use the same generic HID++ battery features and are expected to work, but have not been verified against real hardware. HID++ 1.0 support is tested against a simulated receiver only so far.
+</details>
 
 ## Settings
 
-Configuration lives in `%APPDATA%\logitray\config.toml` (created on first run):
+Everything can be changed from the tray menu and is saved to `%APPDATA%\logitray\config.toml` (**Open config file…** opens it).
 
-| Key | Default | Description |
-| --- | --- | --- |
-| `poll_interval_seconds` | `180` | Backstop re-read interval. Battery/charging changes are pushed via notifications; this only bounds the fallback re-read (and recovery after sleep). |
-| `low_battery_threshold` | `15` | Percent at/below which a low-battery toast fires |
-| `low_battery_cooldown_minutes` | `120` | Minimum time between repeat alerts per device |
-| `notifications_enabled` | `true` | Whether low-battery toasts are shown at all |
-| `selected_device_id` | `"lowest"` | Which device the tray follows: `"lowest"` for Automatic (lowest battery), or a device key chosen from the menu |
-| `autostart` | `false` | Start logitray when you log in |
-| `log_level` | `"info"` | Log verbosity (`error`/`warn`/`info`/`debug`/`trace`). Applies to logitray's own output; dependencies are capped at `info` so `debug` doesn't fill the log with HTTP internals from the update check. |
-| `language` | `"auto"` | UI language: `auto` (Windows display language), `en`, or `zh-CN`. Unknown values fall back to English. |
-| `view_mode` | `"icon"` | Tray display: `icon` (battery glyph) or `text` (percentage) |
-| `check_for_updates` | `true` | Look for a newer release on GitHub at startup and once a day. Notify only; nothing is downloaded. |
-| `last_notified_update` | `""` | Release the update toast was last shown for (set automatically) |
+| Menu item | Config key | Default | Notes |
+| --- | --- | --- | --- |
+| Select Device | `selected_device_id` | `"lowest"` | `"lowest"` is Automatic, otherwise a device chosen from the menu |
+| Show percentage as text | `view_mode` | `"icon"` | `icon` (battery glyph) or `text` (percentage) |
+| Language | `language` | `"auto"` | `auto`, `en`, or `zh-CN`. Auto picks Simplified Chinese for a Chinese (Mainland China, Singapore) Windows display language and English for everything else |
+| Poll interval | `poll_interval_seconds` | `180` | Backstop re-read only, since changes are pushed. 15 seconds to 15 minutes |
+| Enable low-battery notifications | `notifications_enabled` | `true` | |
+| Low battery alert at | `low_battery_threshold` | `15` | Percent, 5 to 30 |
+| Reminder interval | `low_battery_cooldown_minutes` | `120` | Minimum time between repeat alerts, per device. 30 minutes to 8 hours |
+| Start at login | `autostart` | `false` | |
+| Check for updates automatically | `check_for_updates` | `true` | See below |
+| | `log_level` | `"info"` | `error`, `warn`, `info`, `debug`, or `trace` |
 
-Enumerated device details (which battery feature to use, the device name) are cached per device in `%APPDATA%\logitray\devices.toml` so cold starts can skip the slower HID++ feature enumeration. It's safe to delete — it rebuilds itself.
+The log is written to `%APPDATA%\logitray\logitray.log`, rotated at 1 MB with the last three kept.
 
-Logs are written to `%APPDATA%\logitray\logitray.log` (rotated, last few kept).
+### Update check
 
-## Limitations
+About a minute after startup and then once a day, logitray asks GitHub for the latest release tag. GitHub sees your IP address and the app version, nothing else. If a newer release exists, you get one notification per version and an **Update available** menu entry that opens the release page. Nothing is downloaded or installed automatically. Turning the check back on checks right away.
 
-- Windows only.
-- Supports Logitech USB receivers and direct USB-connected HID++ 2.0 devices that expose battery data. Bluetooth-only connections are not supported.
-- Works best with an HID++ 2.0 device (essentially all modern Logitech wireless mice/keyboards). HID++ 1.0 devices need the receiver's short HID collection, and most only report coarse battery levels.
-- For devices reporting voltage (feature `0x1001`), the percentage is an estimate from a voltage curve.
-- Coexists with Logitech G HUB / Options+ if they're installed, but neither is required.
+## Supported devices
 
-## For developers
+Logitech wireless devices on a **Unifying**, **LIGHTSPEED**, or **Bolt** receiver (up to six per receiver), plus modern devices connected directly with a USB cable. Bluetooth connections are not supported. G HUB and Options+ can stay installed alongside.
 
-Build from source with [Rust](https://rustup.rs/):
+Modern devices report their own name, so they show up as you know them. Some devices only report their voltage, so their percentage is an estimate. Older devices such as the original K800 usually only report a coarse level (90, 50, 20, or 5%).
 
-```sh
-cargo build --release          # build
-cargo run                      # start the tray app
-cargo run -- --once            # print battery level to stdout
-cargo run -- --diag            # dump HID++ interfaces, ping results, notification + register probe (hardware debugging)
-```
+So far only a **G502 X PLUS** over LIGHTSPEED has been tested on real hardware. Other devices should work the same way. If yours doesn't show up, exit logitray, open PowerShell in the folder with the exe, run `.\logitray.exe --diag | Tee-Object diag.txt`, and attach `diag.txt` to an [issue](https://github.com/Ithilias/logitray/issues).
 
-The release binary and CI build with the **MSVC** toolchain (`x86_64-pc-windows-msvc`), which works out of the box on `windows-latest`. To build locally with the **GNU** toolchain instead, you also need a full MinGW-w64 on `PATH` (the `windows` crates invoke `dlltool`/`as`, and `build.rs` uses `windres` to embed the exe's version info, which rustup's bundled MinGW does not fully provide).
+## Contributing
 
-CI lives in [`.github/workflows`](.github/workflows): `pr-build` tests and builds on every push/PR, and `release-on-tag` cuts a GitHub release with the exe and a SHA256 checksum when you push a `v*.*.*` tag.
+Build instructions and an overview of how logitray talks to the devices are in [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Acknowledgements
 
