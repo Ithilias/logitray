@@ -1,0 +1,54 @@
+name: Device problem
+description: A device doesn't show up, shows the wrong battery level, or doesn't update
+labels: [bug]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happens
+      description: What you expected and what you see instead.
+    validations:
+      required: true
+  - type: input
+    id: device
+    attributes:
+      label: Device
+      description: The model of the device with the problem, and of any other Logitech devices connected.
+      placeholder: K800 keyboard, MX Master mouse (works)
+    validations:
+      required: true
+  - type: dropdown
+    id: connection
+    attributes:
+      label: Connection
+      options:
+        - Unifying receiver
+        - LIGHTSPEED receiver
+        - Bolt receiver
+        - USB cable
+        - Bluetooth
+        - Not sure
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: logitray version
+      description: Right-click logitray.exe, then Properties, then Details. It is also the first line of the diagnostics below.
+      placeholder: 0.4.0
+    validations:
+      required: true
+  - type: textarea
+    id: diag
+    attributes:
+      label: Diagnostics
+      description: |
+        Exit logitray first (right-click the tray icon, then Exit). Open PowerShell in the folder with logitray.exe and run `.\logitray.exe --diag | Tee-Object diag.txt`. It takes about a minute per receiver. Paste the contents of diag.txt here, or attach the file. Don't use `>` to save it, that leaves the file empty.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Other Logitech software running (G HUB, Options+), recent changes, or lines from %APPDATA%\logitray\logitray.log.
