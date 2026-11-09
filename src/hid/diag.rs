@@ -8,27 +8,157 @@
 //! It then listens for receiver notifications, and finally probes each slot's
 //! HID++ 1.0 battery registers and a 2.0 ping, printing which collection every
 //! answer arrives on (the data a HID++ 1.0 device report needs).
+//!
+//! The output is meant to be pasted into a GitHub issue, so it opens with the
+//! version and settings and ends with what `--once` makes of the same hardware.
 
+use crate::config::{self, AppConfig};
+use crate::hid::client;
 use crate::hid::protocol::{self, ping, READ_TIMEOUT_MS, SHORT_REPORT_ID};
 use crate::hid::receiver;
 use crate::hid::scanner::{
     open_notifier, open_receiver, scan_receivers, ReceiverPath, LOGITECH_VID,
 };
 use hidapi::{HidApi, HidDevice};
+use std::fs;
+use std::io::ErrorKind;
 use std::time::Instant;
+use tracing_subscriber::EnvFilter;
 
 const HIDPP_USAGE_PAGE: u16 = 0xFF00;
 
 pub fn run_diag() {
-    let api = match HidApi::new() {
-        Ok(api) => api,
-        Err(err) => {
-            println!("failed to init hidapi: {err}");
-            return;
-        }
-    };
+    let start = Instant::now();
+    print_header();
+    print_settings();
+    match HidApi::new() {
+        Ok(api) => probe_interfaces(&api),
+        Err(err) => println!("failed to init hidapi: {err}"),
+    }
+    print_summary();
+    println!("\nFinished in {} s.", start.elapsed().as_secs());
+}
 
-    println!("=== All VID 0x046D HID interfaces hidapi sees ===");
+fn print_header() {
+    println!("=== logitray {} diagnostics ===", env!("CARGO_PKG_VERSION"));
+    println!("{}", windows_version());
+    println!("This takes about a minute per receiver. Close the logitray tray app first,");
+    println!("and press a key or move each device now so it is awake for the probes.");
+}
+
+/// The Windows build, from the registry. `ProductName` still says "Windows 10"
+/// on Windows 11, so the build number is what tells them apart.
+#[cfg(windows)]
+fn windows_version() -> String {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+
+    let Ok(key) = RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
+    else {
+        return "Windows version unknown".to_string();
+    };
+    let build: String = key.get_value("CurrentBuild").unwrap_or_default();
+    let mut line = format!("Windows build {build}");
+    if let Ok(ubr) = key.get_value::<u32, _>("UBR") {
+        line.push_str(&format!(".{ubr}"));
+    }
+    if let Ok(release) = key.get_value::<String, _>("DisplayVersion") {
+        line.push_str(&format!(" ({release})"));
+    }
+    line
+}
+
+#[cfg(not(windows))]
+fn windows_version() -> String {
+    "not Windows".to_string()
+}
+
+/// The settings that change what the worker does, and the cached device
+/// profiles, which can make it skip enumeration. Read only: unlike the tray,
+/// this never creates, rewrites or moves a config file. Paths are printed with
+/// `%APPDATA%` rather than the expanded user profile path.
+fn print_settings() {
+    println!("\n=== Settings (%APPDATA%\\logitray) ===");
+    match fs::read_to_string(config::config_path()) {
+        Ok(raw) => match toml::from_str::<AppConfig>(&raw) {
+            Ok(cfg) => println!(
+                "config.toml: selected_device_id={:?} poll_interval_seconds={} log_level={:?}",
+                cfg.selected_device_id, cfg.poll_interval_seconds, cfg.log_level
+            ),
+            Err(err) => {
+                println!("config.toml: does not parse");
+                for line in err.to_string().lines() {
+                    println!("   {line}");
+                }
+            }
+        },
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            println!("config.toml: not found (defaults)");
+        }
+        Err(err) => println!("config.toml: cannot be read ({err})"),
+    }
+    // The tray moves a config it cannot parse here and starts from defaults.
+    if config::invalid_config_path().exists() {
+        println!("config.toml.invalid: present (an earlier config did not parse)");
+    }
+
+    let profiles = config::load_device_profiles();
+    if profiles.devices.is_empty() {
+        println!("devices.toml: no cached devices");
+        return;
+    }
+    println!("devices.toml:");
+    let mut entries: Vec<_> = profiles.devices.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(b.0));
+    for (wpid, profile) in entries {
+        let source = match profile.battery_register {
+            Some(register) => format!("register 0x{register:02X}"),
+            None => format!(
+                "feature 0x{:04X} at index {}",
+                profile.battery_feature_id, profile.battery_feature_index
+            ),
+        };
+        println!("   wpid {wpid}: {:?}, {source}", profile.name);
+    }
+}
+
+/// What the normal one-shot read concludes, so a report does not need a
+/// separate `--once` run. Like `--once`, this may add to `devices.toml`.
+fn print_summary() {
+    println!("\n=== Summary: what --once reads ===");
+    // The worker's debug lines say which feature or register each read tried,
+    // which is what the log file would otherwise have to be asked for.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(EnvFilter::new("info,logitray=debug"))
+        .with_target(false)
+        .with_ansi(false)
+        .without_time()
+        .with_writer(std::io::stdout)
+        .try_init();
+    let result = client::poll_once();
+    println!();
+    if result.devices.is_empty() {
+        println!("no devices read");
+    }
+    for dev in &result.devices {
+        println!(
+            "{}: {}%{}  (receiver {:04X}, index {}, key {})",
+            dev.display_name,
+            dev.battery_percent,
+            if dev.is_charging { " charging" } else { "" },
+            dev.pid,
+            dev.device_index,
+            dev.device_key,
+        );
+    }
+    for err in &result.errors {
+        println!("error: {err}");
+    }
+}
+
+fn probe_interfaces(api: &HidApi) {
+    println!("\n=== All VID 0x046D HID interfaces hidapi sees ===");
     let mut hidpp_paths = Vec::new();
     for info in api.device_list() {
         if info.vendor_id() != LOGITECH_VID {
@@ -50,7 +180,7 @@ pub fn run_diag() {
     }
 
     println!("\n=== scan_receivers() result ===");
-    let receivers = scan_receivers(&api);
+    let receivers = scan_receivers(api);
     if receivers.is_empty() {
         println!("(none matched VID 0x046D + usage_page 0x{HIDPP_USAGE_PAGE:04X})");
     } else {
@@ -159,8 +289,8 @@ pub fn run_diag() {
         }
     }
 
-    notification_probe(&api, &receivers);
-    register_probe(&api, &receivers);
+    notification_probe(api, &receivers);
+    register_probe(api, &receivers);
 }
 
 /// How long [`register_probe`] listens for answers to one request.
@@ -286,12 +416,12 @@ fn hex(bytes: &[u8]) -> String {
 /// Probe the receiver's short collection (usage 0x0001), where HID++ 1.0
 /// registers and the device-connection notification live. Enable notifications,
 /// read the connected count, ask the receiver to re-announce, then dump and
-/// classify reports for ~10s. A `Connection { .. }` here is the instant
+/// classify reports for ~35s. A `Connection { .. }` here is the instant
 /// device-arrival signal the tray uses; battery is then read on the long
 /// collection. If the short collection is absent or silent, the app falls back
 /// to the fast ping sweep + periodic safety re-read.
 fn notification_probe(api: &HidApi, receivers: &[ReceiverPath]) {
-    println!("\n=== Notification probe (short collection: enable + announce, listen ~10s) ===");
+    println!("\n=== Notification probe (short collection: enable + announce, listen ~35s) ===");
     for recv in receivers {
         println!("\n-- PID {:04X}", recv.pid);
         let dev = match open_notifier(api, recv) {
@@ -320,7 +450,7 @@ fn notification_probe(api: &HidApi, receivers: &[ReceiverPath]) {
         // whether the device pushes anything (and on which interface).
         let long = open_receiver(api, recv).ok();
 
-        println!("   listening ~35s on SHORT + LONG — toggle the charger now...");
+        println!("   listening ~35s on SHORT + LONG; plug or unplug a charging cable now...");
         let mut got_anything = false;
         for _ in 0..70 {
             for (label, handle) in [Some(("short", &dev)), long.as_ref().map(|l| ("long", l))]
@@ -338,7 +468,11 @@ fn notification_probe(api: &HidApi, receivers: &[ReceiverPath]) {
                             Some(r) => {
                                 let mut s = format!("{:?}", protocol::classify(&r));
                                 if let Some(c) = receiver::parse_connection(&r) {
-                                    s = format!("{s}  {c:?}");
+                                    s = format!(
+                                        "{s}  link {} wpid 0x{:04X}",
+                                        if c.link_established { "up" } else { "down" },
+                                        c.wpid
+                                    );
                                 }
                                 s
                             }
@@ -351,7 +485,7 @@ fn notification_probe(api: &HidApi, receivers: &[ReceiverPath]) {
             }
         }
         if !got_anything {
-            println!("   (no reports — receiver does not push notifications)");
+            println!("   (no reports: receiver does not push notifications)");
         }
     }
 }

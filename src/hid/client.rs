@@ -830,7 +830,10 @@ fn handle_connection<F>(
                 if err.downcast_ref::<Unavailable>().is_some() {
                     cache.unavailable.insert(key);
                 }
-                tracing::warn!("receiver {pid:04X} index {slot}: {err}");
+                tracing::warn!(
+                    "receiver {pid:04X} index {slot} (wpid {:04X}): {err:#}",
+                    conn.wpid
+                );
             }
         }
     } else {
@@ -1308,9 +1311,12 @@ fn poll_receiver(
         match read_device(long, short, slot, receiver, wpid, &mut cache, profiles) {
             Ok(Some(state)) => result.devices.push(state),
             Ok(None) => {}
-            Err(err) => result
-                .errors
-                .push(format!("receiver {:04X} index {slot}: {err}", receiver.pid)),
+            // The alternate form keeps the cause chain: "feature enumeration
+            // failed" alone does not say why.
+            Err(err) => result.errors.push(format!(
+                "receiver {:04X} index {slot} (wpid {wpid:04X}): {err:#}",
+                receiver.pid
+            )),
         }
     }
 }
