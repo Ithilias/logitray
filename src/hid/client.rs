@@ -15,6 +15,7 @@
 
 use crate::config::{self, DeviceProfile, DeviceProfiles};
 use crate::device_map;
+use crate::hid::link::HidLink;
 use crate::hid::protocol::{
     classify, get_battery_status, get_battery_voltage, get_feature, get_feature_count,
     get_feature_id, get_unified_battery_status, is_charging_from_flags, is_charging_from_status,
@@ -25,7 +26,7 @@ use crate::hid::receiver::{self};
 use crate::hid::scanner::{open_notifier, open_receiver, scan_receivers, ReceiverPath};
 use crate::model::{BatteryState, PollResult};
 use anyhow::{bail, Context, Result};
-use hidapi::{HidApi, HidDevice};
+use hidapi::HidApi;
 use std::collections::{BTreeSet, HashMap};
 use std::sync::mpsc;
 use std::thread;
@@ -139,9 +140,36 @@ where
     // both collections from the thread that uses them.
     let api = HidApi::new().context("failed to initialize hidapi")?;
     let mut long = open_receiver(&api, receiver).context("failed to open device interface")?;
-    let short = open_notifier(&api, receiver).ok();
-    if detect_direct_usb(&mut long, short.as_ref()) {
-        return run_direct_worker(&mut long, receiver, safety_secs, cmd_rx, emit);
+    let short = open_notifier(&api, receiver)
+        .ok()
+        .map(|dev| Box::new(dev) as Box<dyn HidLink>);
+    run_worker_on(
+        &mut long,
+        short,
+        receiver,
+        config::load_device_profiles(),
+        safety_secs,
+        cmd_rx,
+        emit,
+    )
+}
+
+/// The worker proper, on already-open collections (simulated ones in tests).
+fn run_worker_on<F>(
+    long: &mut dyn HidLink,
+    short: Option<Box<dyn HidLink>>,
+    receiver: &ReceiverPath,
+    mut profiles: DeviceProfiles,
+    safety_secs: u64,
+    cmd_rx: &mpsc::Receiver<WorkerCommand>,
+    emit: &F,
+) -> Result<()>
+where
+    F: Fn(DeviceEvent),
+{
+    let short = short.as_deref();
+    if detect_direct_usb(long, short) {
+        return run_direct_worker(long, receiver, safety_secs, cmd_rx, emit);
     }
     if short.is_none() {
         tracing::info!(
@@ -151,32 +179,24 @@ where
     }
 
     let mut cache = FeatureCache::new();
-    let mut profiles = config::load_device_profiles();
     let mut known: BTreeSet<u8> = BTreeSet::new();
     let mut safety = Duration::from_secs(safety_secs.max(MIN_SAFETY_SECS));
 
     // Initial discovery. With notifications, enable them and ask the receiver to
     // announce its connected devices — the resulting 0x41 reports drive the read
     // loop below. Without, probe slots directly.
-    if let Some(short) = &short {
+    if let Some(short) = short {
         // Notification setup was already attempted during transport detection.
         let _ = receiver::poke_announce(short);
     } else {
-        discover_by_ping(
-            &mut long,
-            receiver,
-            &mut cache,
-            &mut profiles,
-            &mut known,
-            emit,
-        );
+        discover_by_ping(long, receiver, &mut cache, &mut profiles, &mut known, emit);
     }
 
     let mut last_safety = Instant::now();
     loop {
         // Primary wait: a connection notification on the short interface, or a
         // timeout that lets us service commands and the safety timer.
-        if let Some(short) = &short {
+        if let Some(short) = short {
             let mut buf = [0u8; 21];
             match short.read_timeout(&mut buf, SHORT_WAIT_MS) {
                 Ok(0) => {}
@@ -185,7 +205,7 @@ where
                         if let Some(conn) = receiver::parse_connection(&report) {
                             handle_connection(
                                 conn,
-                                &mut long,
+                                long,
                                 receiver,
                                 &mut cache,
                                 &mut profiles,
@@ -205,17 +225,17 @@ where
         // Drain any unsolicited HID++ 2.0 battery events the device pushed on the
         // long interface (e.g. charging started/stopped) and reflect them right
         // away rather than waiting for the safety re-read.
-        drain_long_events(&mut long, receiver, &mut cache, &mut profiles, &known, emit);
+        drain_long_events(long, receiver, &mut cache, &mut profiles, &known, emit);
 
         // Drain pending commands.
         loop {
             match cmd_rx.try_recv() {
                 Ok(WorkerCommand::Refresh) => {
-                    if let Some(short) = &short {
+                    if let Some(short) = short {
                         let _ = receiver::poke_announce(short);
                     } else {
                         discover_by_ping(
-                            &mut long,
+                            long,
                             receiver,
                             &mut cache,
                             &mut profiles,
@@ -223,7 +243,7 @@ where
                             emit,
                         );
                     }
-                    reread_known(&mut long, receiver, &mut cache, &known, emit);
+                    reread_known(long, receiver, &mut cache, &known, emit);
                 }
                 Ok(WorkerCommand::SetSafetyInterval(secs)) => {
                     safety = Duration::from_secs(secs.max(MIN_SAFETY_SECS));
@@ -237,20 +257,13 @@ where
         // Safety timer: re-assert notifications (resume guard), re-discover on
         // the no-notification path, and re-read battery for known devices.
         if last_safety.elapsed() >= safety {
-            if let Some(short) = &short {
+            if let Some(short) = short {
                 let _ = receiver::enable_notifications(short);
                 let _ = receiver::poke_announce(short);
             } else {
-                discover_by_ping(
-                    &mut long,
-                    receiver,
-                    &mut cache,
-                    &mut profiles,
-                    &mut known,
-                    emit,
-                );
+                discover_by_ping(long, receiver, &mut cache, &mut profiles, &mut known, emit);
             }
-            reread_known(&mut long, receiver, &mut cache, &known, emit);
+            reread_known(long, receiver, &mut cache, &known, emit);
             last_safety = Instant::now();
         }
     }
@@ -259,7 +272,7 @@ where
 /// Use normal receiver setup first. A successful register request identifies
 /// a receiver even when no wireless device is connected; do not pay USB ping
 /// timeouts merely because its device list is empty.
-fn detect_direct_usb(long: &mut HidDevice, short: Option<&HidDevice>) -> bool {
+fn detect_direct_usb(long: &mut dyn HidLink, short: Option<&dyn HidLink>) -> bool {
     direct_usb_fallback(
         || {
             short.is_some_and(|short| {
@@ -282,7 +295,7 @@ fn direct_usb_fallback(
 // A receiver speaks HID++ 1.0 at 0xFF; a wired device answers the HID++ 2.0
 // root ping there. Verify both the protocol version and echo, rather than
 // inferring connection type from a product name or a guessed PID range.
-fn is_direct_device(long: &mut HidDevice) -> bool {
+fn is_direct_device(long: &mut dyn HidLink) -> bool {
     let echo = 0x55;
     send_recv_with(
         long,
@@ -298,7 +311,7 @@ fn direct_ping_reply(reply: &[u8; 7], echo: u8) -> bool {
 }
 
 fn run_direct_worker<F>(
-    long: &mut HidDevice,
+    long: &mut dyn HidLink,
     receiver: &ReceiverPath,
     safety_secs: u64,
     cmd_rx: &mpsc::Receiver<WorkerCommand>,
@@ -358,7 +371,7 @@ where
 /// departure on link-down.
 fn handle_connection<F>(
     conn: receiver::ConnectionNotification,
-    long: &mut HidDevice,
+    long: &mut dyn HidLink,
     receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     profiles: &mut DeviceProfiles,
@@ -402,7 +415,7 @@ fn handle_connection<F>(
 
 /// Re-read battery for every currently-known device (safety timer / refresh).
 fn reread_known<F>(
-    long: &mut HidDevice,
+    long: &mut dyn HidLink,
     receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     known: &BTreeSet<u8>,
@@ -433,7 +446,7 @@ fn reread_known<F>(
 /// battery and emit the fresh reading. Non-blocking — returns as soon as no more
 /// reports are queued.
 fn drain_long_events<F>(
-    long: &mut HidDevice,
+    long: &mut dyn HidLink,
     receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     profiles: &mut DeviceProfiles,
@@ -482,7 +495,7 @@ fn drain_long_events<F>(
 /// Fallback discovery for receivers without a notification interface: probe
 /// slots with the short ping budget and read whatever answers.
 fn discover_by_ping<F>(
-    long: &mut HidDevice,
+    long: &mut dyn HidLink,
     receiver: &ReceiverPath,
     cache: &mut FeatureCache,
     profiles: &mut DeviceProfiles,
@@ -513,7 +526,7 @@ fn discover_by_ping<F>(
 
 /// Cheap presence check: a ping with the short discovery budget. Empty/asleep
 /// slots cost ~PING_TIMEOUT_MS*PING_RETRIES instead of the full data budget.
-fn ping_slot(dev: &mut HidDevice, slot: u8) -> bool {
+fn ping_slot(dev: &mut dyn HidLink, slot: u8) -> bool {
     let echo: u8 = 0x55 ^ slot;
     matches!(
         send_recv_with(dev, ping(slot, echo), PING_TIMEOUT_MS, PING_RETRIES),
@@ -576,7 +589,7 @@ fn invalidate_changed_device(cache: &mut FeatureCache, key: &str, wpid: u16) -> 
 /// trip enumeration on a freshly-woken device; falls back to live enumeration
 /// and rewrites the profile if the cached feature index no longer works.
 fn read_device(
-    dev: &mut HidDevice,
+    dev: &mut dyn HidLink,
     slot: u8,
     receiver: &ReceiverPath,
     wpid: u16,
@@ -612,7 +625,7 @@ fn read_device(
 /// WPID is known and the cached battery feature still answers, otherwise via
 /// live feature enumeration (which then updates the persisted profile).
 fn resolve_device(
-    dev: &mut HidDevice,
+    dev: &mut dyn HidLink,
     slot: u8,
     wpid: u16,
     profiles: &mut DeviceProfiles,
@@ -657,7 +670,9 @@ fn resolve_device(
             // Update this worker's own snapshot, then merge the one entry into
             // the file. Writing the whole snapshot back would drop whatever
             // another receiver's worker has learned since this thread started.
-            if profiles.upsert(wpid, profile.clone()) {
+            // Tests drive this with simulated devices; their profiles stay in
+            // memory rather than landing in the real devices.toml.
+            if profiles.upsert(wpid, profile.clone()) && cfg!(not(test)) {
                 if let Err(err) = config::save_device_profile(wpid, profile) {
                     tracing::debug!("failed saving device profile: {err}");
                 }
@@ -699,40 +714,54 @@ pub fn poll_once() -> PollResult {
                 continue;
             }
         };
-        let mut cache = FeatureCache::new();
-        for (slot, wpid) in discover_present_slots(&api, &receiver, &mut long) {
-            match read_device(&mut long, slot, &receiver, wpid, &mut cache, &mut profiles) {
-                Ok(Some(state)) => result.devices.push(state),
-                Ok(None) => {}
-                Err(err) => result
-                    .errors
-                    .push(format!("receiver {:04X} index {slot}: {err}", receiver.pid)),
-            }
-        }
+        let short = open_notifier(&api, &receiver).ok();
+        poll_receiver(
+            &mut long,
+            short.as_ref().map(|dev| dev as &dyn HidLink),
+            &receiver,
+            &mut profiles,
+            &mut result,
+        );
     }
 
     result.sort_devices();
     result
 }
 
+/// `--once` for one receiver, on already-open collections (simulated ones in
+/// tests): discover the present slots and read each, into `result`.
+fn poll_receiver(
+    long: &mut dyn HidLink,
+    short: Option<&dyn HidLink>,
+    receiver: &ReceiverPath,
+    profiles: &mut DeviceProfiles,
+    result: &mut PollResult,
+) {
+    let mut cache = FeatureCache::new();
+    for (slot, wpid) in discover_present_slots(long, short) {
+        match read_device(long, slot, receiver, wpid, &mut cache, profiles) {
+            Ok(Some(state)) => result.devices.push(state),
+            Ok(None) => {}
+            Err(err) => result
+                .errors
+                .push(format!("receiver {:04X} index {slot}: {err}", receiver.pid)),
+        }
+    }
+}
+
 /// Discover which slots currently hold a connected device, returning
 /// `(slot, wpid)` pairs. Prefers the receiver's connection notifications (which
 /// report link state reliably even for an idle device); falls back to a ping
 /// sweep on receivers that expose no short collection.
-fn discover_present_slots(
-    api: &HidApi,
-    receiver: &ReceiverPath,
-    long: &mut HidDevice,
-) -> Vec<(u8, u16)> {
-    let short = open_notifier(api, receiver).ok();
-    if detect_direct_usb(long, short.as_ref()) {
+fn discover_present_slots(long: &mut dyn HidLink, short: Option<&dyn HidLink>) -> Vec<(u8, u16)> {
+    if detect_direct_usb(long, short) {
         return vec![(DIRECT_DEVICE_INDEX, 0)];
     }
     if let Some(short) = short {
         // How many devices to expect, so we can stop listening as soon as they've
         // all announced rather than always waiting out the deadline.
-        let expected = receiver::connected_count(&short).unwrap_or(0) as usize;
-        let _ = receiver::poke_announce(&short);
+        let expected = receiver::connected_count(short).unwrap_or(0) as usize;
+        let _ = receiver::poke_announce(short);
 
         let mut slots: Vec<(u8, u16)> = Vec::new();
         let deadline = Instant::now() + Duration::from_millis(1500);
@@ -769,7 +798,7 @@ fn discover_present_slots(
 
 /// Enumerate features, retrying a couple of times — a device that just woke up
 /// (e.g. right after a connection notification) often fails the first attempt.
-fn build_feature_map_retry(dev: &mut HidDevice, device_index: u8) -> Result<HashMap<u16, u8>> {
+fn build_feature_map_retry(dev: &mut dyn HidLink, device_index: u8) -> Result<HashMap<u16, u8>> {
     const ENUM_RETRIES: usize = 3;
     let mut last_err = None;
     for attempt in 0..ENUM_RETRIES {
@@ -788,7 +817,7 @@ fn build_feature_map_retry(dev: &mut HidDevice, device_index: u8) -> Result<Hash
 }
 
 /// Enumerate all HID++ 2.0 features for a device and return a map of feature_id → index.
-fn build_feature_map(dev: &mut HidDevice, device_index: u8) -> Result<HashMap<u16, u8>> {
+fn build_feature_map(dev: &mut dyn HidLink, device_index: u8) -> Result<HashMap<u16, u8>> {
     // Step 1: get the index of IFeatureSet (0x0001) from IRoot (0x0000).
     let buf = send_recv(dev, get_feature(device_index, 0x0001))?;
     let feature_set_idx = buf[4];
@@ -818,7 +847,7 @@ fn build_feature_map(dev: &mut HidDevice, device_index: u8) -> Result<HashMap<u1
 /// Read the device name via feature 0x0005 (DEVICE_NAME_AND_TYPE).
 /// Returns an error if the feature is absent, so the caller can fall back to a default.
 fn read_device_name(
-    dev: &mut HidDevice,
+    dev: &mut dyn HidLink,
     device_index: u8,
     feature_map: &HashMap<u16, u8>,
 ) -> Result<String> {
@@ -858,7 +887,7 @@ fn read_device_name(
 }
 
 fn read_battery(
-    dev: &mut HidDevice,
+    dev: &mut dyn HidLink,
     device_index: u8,
     feature_id: u16,
     feature_idx: u8,
@@ -888,7 +917,7 @@ fn read_battery(
 
 /// Send a HID++ short message and return the matching 7-byte response, using the
 /// default data-read budget ([`MAX_RETRIES`]/[`READ_TIMEOUT_MS`]).
-fn send_recv(dev: &mut HidDevice, msg: ShortMsg) -> Result<[u8; 7]> {
+fn send_recv(dev: &mut dyn HidLink, msg: ShortMsg) -> Result<[u8; 7]> {
     send_recv_with(dev, msg, READ_TIMEOUT_MS, MAX_RETRIES)
 }
 
@@ -899,7 +928,7 @@ fn send_recv(dev: &mut HidDevice, msg: ShortMsg) -> Result<[u8; 7]> {
 /// pings vs. the generous budget for actual data reads. Returns an error after
 /// `retries` attempts without a match.
 fn send_recv_with(
-    dev: &mut HidDevice,
+    dev: &mut dyn HidLink,
     msg: ShortMsg,
     timeout_ms: i32,
     retries: usize,
@@ -1128,5 +1157,250 @@ mod tests {
         .unwrap();
         assert!(result.is_none());
         assert!(start.elapsed() < Duration::from_secs(1));
+    }
+}
+
+/// End-to-end tests against [`crate::hid::sim`]: the worker and `--once` paths
+/// driving a simulated receiver.
+#[cfg(test)]
+mod sim_tests {
+    use super::*;
+    use crate::hid::sim::{Collection, SimDevice, SimReceiver};
+
+    fn receiver() -> ReceiverPath {
+        ReceiverPath {
+            pid: 0xC52B,
+            key: "sim".into(),
+            long_path: std::ffi::CString::new("long").unwrap(),
+            short_path: None,
+        }
+    }
+
+    fn short_link(sim: &SimReceiver) -> Option<Box<dyn HidLink>> {
+        Some(sim.link(Collection::Short))
+    }
+
+    /// `--once` against the simulator; devices sorted by slot.
+    fn poll(
+        sim: &SimReceiver,
+        short: Option<Box<dyn HidLink>>,
+        profiles: &mut DeviceProfiles,
+    ) -> PollResult {
+        let mut result = PollResult::default();
+        let mut long = sim.link(Collection::Long);
+        poll_receiver(
+            &mut *long,
+            short.as_deref(),
+            &receiver(),
+            profiles,
+            &mut result,
+        );
+        result.devices.sort_by_key(|d| d.device_index);
+        result
+    }
+
+    fn summary(result: &PollResult) -> Vec<(u8, &str, u8, bool)> {
+        result
+            .devices
+            .iter()
+            .map(|d| {
+                let name = d.display_name.as_str();
+                (d.device_index, name, d.battery_percent, d.is_charging)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn mouse_cold_start_enumerates_and_remembers_its_feature() {
+        let sim = SimReceiver::new().with(1, SimDevice::g502(68));
+        let mut profiles = DeviceProfiles::default();
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+
+        assert!(result.errors.is_empty(), "{:?}", result.errors);
+        assert_eq!(summary(&result), [(1, "G502 X PLUS", 68, false)]);
+        let profile = profiles.get(0x4099).expect("G502 profile");
+        assert_eq!(
+            (profile.battery_feature_id, profile.battery_feature_index),
+            (0x1004, 3)
+        );
+        assert_eq!(profile.name, "G502 X PLUS");
+    }
+
+    #[test]
+    fn warm_start_reads_the_remembered_feature_directly() {
+        let sim = SimReceiver::new().with(1, SimDevice::g502(68));
+        let mut profiles = DeviceProfiles::default();
+        poll(&sim, short_link(&sim), &mut profiles);
+        let before = sim.writes().len();
+
+        let result = poll(&sim, short_link(&sim), &mut profiles);
+        assert_eq!(summary(&result), [(1, "G502 X PLUS", 68, false)]);
+        // No enumeration: every request to the mouse goes to the battery feature.
+        let new_writes = sim.writes().split_off(before);
+        let to_mouse: Vec<_> = new_writes
+            .iter()
+            .filter(|(c, w)| *c == Collection::Long && w[1] == 1)
+            .collect();
+        assert!(!to_mouse.is_empty());
+        assert!(to_mouse.iter().all(|(_, w)| w[2] == 3), "{to_mouse:?}");
+    }
+
+    #[test]
+    fn mouse_missing_its_first_requests_is_still_read() {
+        let sim = SimReceiver::new().with(1, SimDevice::g502(68).flaky(2));
+        let result = poll(&sim, short_link(&sim), &mut DeviceProfiles::default());
+        assert_eq!(
+            summary(&result),
+            [(1, "G502 X PLUS", 68, false)],
+            "{:?}",
+            result.errors
+        );
+    }
+
+    #[test]
+    fn two_mice_are_both_read() {
+        let sim = SimReceiver::new()
+            .with(1, SimDevice::g502(68))
+            .with(3, SimDevice::mouse(0x4082, "PRO X SUPERLIGHT", 40));
+        let result = poll(&sim, short_link(&sim), &mut DeviceProfiles::default());
+        assert_eq!(
+            summary(&result),
+            [
+                (1, "G502 X PLUS", 68, false),
+                (3, "PRO X SUPERLIGHT", 40, false)
+            ]
+        );
+    }
+
+    #[test]
+    fn without_a_short_collection_the_mouse_is_found_by_ping() {
+        let sim = SimReceiver::new().with(1, SimDevice::g502(68));
+        let result = poll(&sim, None, &mut DeviceProfiles::default());
+        assert_eq!(summary(&result), [(1, "G502 X PLUS", 68, false)]);
+        // Found by pinging the slots on the long collection.
+        assert!(sim
+            .writes_to(Collection::Long, 2)
+            .iter()
+            .any(|w| w[2] == 0x00 && w[3] >> 4 == 1));
+    }
+
+    /// A worker thread on the simulator; sends Exit and joins on drop.
+    struct Worker {
+        cmd: mpsc::Sender<WorkerCommand>,
+        events: mpsc::Receiver<DeviceEvent>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl Worker {
+        fn start(sim: &SimReceiver) -> Self {
+            Self::start_with(sim, DeviceProfiles::default(), true, 60)
+        }
+
+        fn start_with(
+            sim: &SimReceiver,
+            profiles: DeviceProfiles,
+            with_short: bool,
+            safety_secs: u64,
+        ) -> Self {
+            let (cmd, cmd_rx) = mpsc::channel();
+            let (event_tx, events) = mpsc::channel();
+            let sim = sim.clone();
+            let handle = thread::spawn(move || {
+                let mut long = sim.link(Collection::Long);
+                let short = if with_short { short_link(&sim) } else { None };
+                let emit = move |event| {
+                    let _ = event_tx.send(event);
+                };
+                run_worker_on(
+                    &mut *long,
+                    short,
+                    &receiver(),
+                    profiles,
+                    safety_secs,
+                    &cmd_rx,
+                    &emit,
+                )
+                .unwrap();
+            });
+            Self {
+                cmd,
+                events,
+                handle: Some(handle),
+            }
+        }
+
+        fn next(&self) -> DeviceEvent {
+            self.events
+                .recv_timeout(Duration::from_secs(5))
+                .expect("worker event")
+        }
+
+        fn update_for(&self, slot: u8) -> BatteryState {
+            loop {
+                if let DeviceEvent::Update(state) = self.next() {
+                    if state.device_index == slot {
+                        return state;
+                    }
+                }
+            }
+        }
+    }
+
+    impl Drop for Worker {
+        fn drop(&mut self) {
+            let _ = self.cmd.send(WorkerCommand::Exit);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+        }
+    }
+
+    #[test]
+    fn worker_reads_announced_mice() {
+        let sim = SimReceiver::new()
+            .with(1, SimDevice::g502(68))
+            .with(2, SimDevice::g502(30));
+        let worker = Worker::start(&sim);
+        let mut seen = BTreeSet::new();
+        while seen.len() < 2 {
+            if let DeviceEvent::Update(state) = worker.next() {
+                seen.insert((state.device_index, state.battery_percent));
+            }
+        }
+        assert_eq!(seen, BTreeSet::from([(1, 68), (2, 30)]));
+    }
+
+    #[test]
+    fn worker_refresh_shows_a_fresh_reading() {
+        let sim = SimReceiver::new().with(1, SimDevice::g502(68));
+        let worker = Worker::start(&sim);
+        assert_eq!(worker.update_for(1).battery_percent, 68);
+
+        sim.set_battery(1, 55);
+        worker.cmd.send(WorkerCommand::Refresh).unwrap();
+        while worker.update_for(1).battery_percent != 55 {}
+    }
+
+    #[test]
+    fn worker_reports_a_mouse_link_down() {
+        let sim = SimReceiver::new().with(1, SimDevice::g502(68));
+        let worker = Worker::start(&sim);
+        let state = worker.update_for(1);
+
+        // 0x41 with the link-down bit (0x40) set.
+        sim.push(Collection::Short, &[0x10, 1, 0x41, 0x04, 0x42, 0x99, 0x40]);
+        loop {
+            if let DeviceEvent::Gone(key) = worker.next() {
+                assert_eq!(key, state.device_key);
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn worker_without_a_short_collection_finds_the_mouse() {
+        let sim = SimReceiver::new().with(1, SimDevice::g502(68));
+        let worker = Worker::start_with(&sim, DeviceProfiles::default(), false, 60);
+        assert_eq!(worker.update_for(1).battery_percent, 68);
     }
 }
