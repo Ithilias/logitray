@@ -258,10 +258,15 @@ pub fn save_config(cfg: &AppConfig) -> Result<()> {
 /// we persist it keyed by wireless product id (WPID) and reuse it across boots:
 /// on the next cold start we can read the battery directly instead of running
 /// (and possibly failing) enumeration while the device is still half-asleep.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+///
+/// HID++ 1.0 devices have no feature table; for them `battery_register` names
+/// the battery register to read and the two feature fields are zero.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DeviceProfile {
     pub battery_feature_id: u16,
     pub battery_feature_index: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub battery_register: Option<u8>,
     pub name: String,
 }
 
@@ -286,13 +291,7 @@ impl DeviceProfiles {
     /// avoid a redundant disk write).
     pub fn upsert(&mut self, wpid: u16, profile: DeviceProfile) -> bool {
         match self.devices.get(&Self::key(wpid)) {
-            Some(existing)
-                if existing.battery_feature_id == profile.battery_feature_id
-                    && existing.battery_feature_index == profile.battery_feature_index
-                    && existing.name == profile.name =>
-            {
-                false
-            }
+            Some(existing) if *existing == profile => false,
             _ => {
                 self.devices.insert(Self::key(wpid), profile);
                 true
@@ -455,6 +454,7 @@ mod tests {
             DeviceProfile {
                 battery_feature_id: 0x1001,
                 battery_feature_index: 6,
+                battery_register: None,
                 name: "G Pro".to_string(),
             },
         ));
@@ -464,6 +464,7 @@ mod tests {
             DeviceProfile {
                 battery_feature_id: 0x1001,
                 battery_feature_index: 6,
+                battery_register: None,
                 name: "G Pro".to_string(),
             },
         ));
@@ -475,6 +476,26 @@ mod tests {
         assert_eq!(p.battery_feature_index, 6);
         assert_eq!(p.name, "G Pro");
         assert!(parsed.get(0x1234).is_none());
+    }
+
+    #[test]
+    fn device_profiles_carry_hidpp10_registers_and_read_old_files() {
+        // Written before HID++ 1.0 support: no `battery_register` key.
+        let old = "[devices.4099]\nbattery_feature_id = 4096\nbattery_feature_index = 6\nname = \"G502\"\n";
+        let parsed: DeviceProfiles = toml::from_str(old).expect("parse old profiles");
+        assert_eq!(parsed.get(0x4099).unwrap().battery_register, None);
+
+        let mut profiles = DeviceProfiles::default();
+        let k800 = DeviceProfile {
+            battery_feature_id: 0,
+            battery_feature_index: 0,
+            battery_register: Some(0x07),
+            name: "K800".to_string(),
+        };
+        assert!(profiles.upsert(0x2010, k800.clone()));
+        let raw = toml::to_string_pretty(&profiles).expect("serialize profiles");
+        let parsed: DeviceProfiles = toml::from_str(&raw).expect("parse profiles");
+        assert_eq!(parsed.get(0x2010), Some(&k800));
     }
 
     #[test]

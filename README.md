@@ -81,7 +81,9 @@ Turn the check off with **Check for updates automatically** in the tray menu or 
 
 Any Logitech wireless device that speaks **HID++ 2.0** through a Logitech **Unifying**, **LIGHTSPEED**, or **Bolt** USB receiver: mice, keyboards, trackballs, and so on. Up to six paired devices per receiver are tracked. Devices report their own marketing name over HID++, so there's no large hardcoded device database to maintain. The name you see is the one your device reports. Battery is read via feature `0x1000`, `0x1001` (voltage, converted with a lookup table), or `0x1004`, whichever the device supports.
 
-Tested against a **G502 X PLUS** over a LIGHTSPEED receiver. Other device classes use the same generic HID++ battery features and are expected to work, but have not been verified against real hardware.
+Older devices that only speak **HID++ 1.0** (for example the original K800 keyboard on a Unifying receiver) are read through their battery registers instead, the way [Solaar](https://github.com/pwr-Solaar/Solaar) does. Most of them only report a coarse level, shown as 90, 50, 20 or 5%. They cannot report their name, so a small built-in table names the ones we know.
+
+Tested against a **G502 X PLUS** over a LIGHTSPEED receiver. Other device classes use the same generic HID++ battery features and are expected to work, but have not been verified against real hardware. HID++ 1.0 support is tested against a simulated receiver only so far.
 
 ## Settings
 
@@ -109,7 +111,7 @@ Logs are written to `%APPDATA%\logitray\logitray.log` (rotated, last few kept).
 
 - Windows only.
 - Supports Logitech USB receivers and direct USB-connected HID++ 2.0 devices that expose battery data. Bluetooth-only connections are not supported.
-- Requires an HID++ 2.0 device (essentially all modern Logitech wireless mice/keyboards).
+- Works best with an HID++ 2.0 device (essentially all modern Logitech wireless mice/keyboards). HID++ 1.0 devices need the receiver's short HID collection, and most only report coarse battery levels.
 - For devices reporting voltage (feature `0x1001`), the percentage is an estimate from a voltage curve.
 - Coexists with Logitech G HUB / Options+ if they're installed, but neither is required.
 
@@ -121,7 +123,7 @@ Build from source with [Rust](https://rustup.rs/):
 cargo build --release          # build
 cargo run                      # start the tray app
 cargo run -- --once            # print battery level to stdout
-cargo run -- --diag            # dump HID++ interfaces, ping results + notification probe (hardware debugging)
+cargo run -- --diag            # dump HID++ interfaces, ping results, notification + register probe (hardware debugging)
 ```
 
 The release binary and CI build with the **MSVC** toolchain (`x86_64-pc-windows-msvc`), which works out of the box on `windows-latest`. To build locally with the **GNU** toolchain instead, you also need a full MinGW-w64 on `PATH` (the `windows` crates invoke `dlltool`/`as`, and `build.rs` uses `windres` to embed the exe's version info, which rustup's bundled MinGW does not fully provide).
