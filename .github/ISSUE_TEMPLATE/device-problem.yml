@@ -35,7 +35,7 @@ body:
     attributes:
       label: logitray version
       description: Right-click logitray.exe, then Properties, then Details. It is also the first line of the diagnostics below.
-      placeholder: 0.4.0
+      placeholder: 0.5.0
     validations:
       required: true
   - type: textarea
