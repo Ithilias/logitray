@@ -12,11 +12,12 @@ use crate::APP_ID;
 use anyhow::{Context, Result};
 use hidapi::HidApi;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 use tao::event::Event;
-use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
+use tao::event_loop::{ControlFlow, DeviceEventFilter, EventLoopBuilder, EventLoopProxy};
 use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
@@ -27,6 +28,8 @@ enum UserEvent {
     Device(DeviceEvent),
     /// The background update check found a release newer than this build.
     UpdateAvailable(Version),
+    /// The tray menu has closed; a deferred Select Device rebuild can run.
+    MenuClosed,
 }
 
 /// Preset choices for the menu submenus. The numeric value is encoded into each
@@ -69,7 +72,11 @@ struct MenuHandles {
     update_available_item: Option<MenuItem>,
     open_config_item: MenuItem,
     exit_item: MenuItem,
+    /// Auto first, then one item per device in `device_keys` order.
     device_items: Vec<CheckMenuItem>,
+    /// The device keys the Select Device submenu currently shows, in order.
+    /// None until a rebuild has completed, and again if one failed part way.
+    device_keys: Option<Vec<String>>,
     language_items: Vec<CheckMenuItem>,
     poll_items: Vec<CheckMenuItem>,
     threshold_items: Vec<CheckMenuItem>,
@@ -193,6 +200,7 @@ impl MenuHandles {
             open_config_item,
             exit_item,
             device_items: Vec::new(),
+            device_keys: None,
             language_items,
             poll_items,
             threshold_items,
@@ -201,6 +209,15 @@ impl MenuHandles {
     }
 
     fn rebuild_device_menu(&mut self, devices: &[BatteryState], selected_id: &str) -> Result<()> {
+        // Unknown until every item is in place, so that a rebuild failing
+        // part way is retried rather than patched in place with items missing.
+        self.device_keys = None;
+        self.fill_device_menu(devices, selected_id)?;
+        self.device_keys = Some(devices.iter().map(|d| d.device_key.clone()).collect());
+        Ok(())
+    }
+
+    fn fill_device_menu(&mut self, devices: &[BatteryState], selected_id: &str) -> Result<()> {
         let language = self.language;
         for item in self.select_submenu.items() {
             remove_item(&self.select_submenu, &item)?;
@@ -249,6 +266,34 @@ impl MenuHandles {
         }
 
         Ok(())
+    }
+
+    /// Refresh the labels and checkmarks of the device items already shown,
+    /// matched by key. Items whose device has gone are left alone until the
+    /// next rebuild. It adds and removes nothing, so it is safe while the
+    /// menu is open.
+    fn update_device_items(&self, devices: &[BatteryState], selected_id: &str) {
+        let Some(shown) = &self.device_keys else {
+            return;
+        };
+        let language = self.language;
+        let pinned_key = find_selected_device(devices, selected_id).map(|d| d.device_key.as_str());
+        if let Some(auto) = self.device_items.first() {
+            auto.set_checked(selected_id == config::AUTO_SUBJECT_ID);
+        }
+        let items = self.device_items.iter().skip(1);
+        for (item, device) in items.zip(shown_devices(shown, devices)) {
+            let Some(device) = device else {
+                continue;
+            };
+            item.set_text(battery_label(
+                language,
+                &device.display_name,
+                device.battery_percent,
+                device.is_charging,
+            ));
+            item.set_checked(pinned_key == Some(device.device_key.as_str()));
+        }
     }
 
     fn show_update(&mut self, version: Version) -> Result<()> {
@@ -402,6 +447,188 @@ fn language_for_id(id: &str) -> Option<Language> {
         .map(|&(_, language)| language)
 }
 
+/// How often the close watch asks whether the tray menu has closed, while a
+/// Select Device rebuild is waiting for it.
+const MENU_CLOSE_POLL: Duration = Duration::from_millis(250);
+
+/// What a device change needs from the Select Device submenu.
+#[derive(Debug, PartialEq, Eq)]
+enum DeviceMenuAction {
+    /// Same devices in the same order: refresh labels and checkmarks.
+    UpdateInPlace,
+    /// Devices came or went: replace the items.
+    Rebuild,
+    /// Devices came or went while the menu is open: refresh the items that
+    /// are still right, rebuild once it closes. Items removed under an open
+    /// submenu stay drawn but no longer respond.
+    Defer,
+}
+
+/// The current reading for each device the submenu shows, in its order; None
+/// where that device has gone.
+fn shown_devices<'a>(
+    shown_keys: &[String],
+    devices: &'a [BatteryState],
+) -> Vec<Option<&'a BatteryState>> {
+    shown_keys
+        .iter()
+        .map(|key| devices.iter().find(|device| device.device_key == *key))
+        .collect()
+}
+
+/// Whether a click on the Select Device item `device_id` may become the
+/// selection: Auto, or a device that is still connected. A device that left
+/// while the menu was open keeps its item until the menu closes.
+fn is_selectable(device_id: &str, devices: &[BatteryState]) -> bool {
+    device_id == config::AUTO_SUBJECT_ID || devices.iter().any(|d| d.device_key == device_id)
+}
+
+/// `shown_keys` is None when the submenu's contents are unknown (see
+/// `MenuHandles::device_keys`), which always needs a rebuild.
+fn device_menu_action(
+    shown_keys: Option<&[String]>,
+    devices: &[BatteryState],
+    menu_open: bool,
+) -> DeviceMenuAction {
+    let same = shown_keys.is_some_and(|shown| {
+        shown.len() == devices.len()
+            && shown
+                .iter()
+                .zip(devices)
+                .all(|(key, device)| *key == device.device_key)
+    });
+    if same {
+        DeviceMenuAction::UpdateInPlace
+    } else if menu_open {
+        DeviceMenuAction::Defer
+    } else {
+        DeviceMenuAction::Rebuild
+    }
+}
+
+/// Bring the Select Device submenu in line with `devices`, or leave it to
+/// `close_watch` when that needs new items while the menu is open.
+fn sync_device_menu(
+    menu: &mut MenuHandles,
+    devices: &[BatteryState],
+    selected_id: &str,
+    close_watch: &MenuCloseWatch,
+) {
+    let menu_open = tray_menu_is_open(close_watch.ui_thread);
+    match device_menu_action(menu.device_keys.as_deref(), devices, menu_open) {
+        DeviceMenuAction::UpdateInPlace => menu.update_device_items(devices, selected_id),
+        DeviceMenuAction::Rebuild => {
+            if let Err(err) = menu.rebuild_device_menu(devices, selected_id) {
+                tracing::warn!("failed rebuilding menu: {err}");
+            }
+        }
+        DeviceMenuAction::Defer => {
+            menu.update_device_items(devices, selected_id);
+            close_watch.start();
+        }
+    }
+}
+
+/// Wakes the event loop with `UserEvent::MenuClosed` once the tray menu has
+/// closed. Nothing else says so: tray-icon returns from the menu without an
+/// event, and a tao `WaitUntil` set while the menu was open never fired in
+/// testing. So a short-lived thread asks Windows about the UI thread instead.
+struct MenuCloseWatch {
+    ui_thread: u32,
+    watching: Arc<AtomicBool>,
+    proxy: EventLoopProxy<UserEvent>,
+}
+
+impl MenuCloseWatch {
+    /// Must be created on the thread that runs the event loop.
+    fn new(proxy: EventLoopProxy<UserEvent>) -> Self {
+        Self {
+            ui_thread: current_thread_id(),
+            watching: Arc::new(AtomicBool::new(false)),
+            proxy,
+        }
+    }
+
+    /// Start watching, unless a watch is already running.
+    fn start(&self) {
+        if self.watching.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let ui_thread = self.ui_thread;
+        let watching = Arc::clone(&self.watching);
+        let proxy = self.proxy.clone();
+        thread::spawn(move || {
+            // Sleep first, so that even a failing check cannot spin.
+            loop {
+                thread::sleep(MENU_CLOSE_POLL);
+                if !tray_menu_is_open(ui_thread) {
+                    break;
+                }
+            }
+            watching.store(false, Ordering::SeqCst);
+            let _ = proxy.send_event(UserEvent::MenuClosed);
+        });
+    }
+}
+
+/// Whether `thread_id` is tracking a popup menu. For the event loop thread,
+/// that means the tray menu is open; device events reach us from inside the
+/// menu's modal loop on that same thread.
+fn tray_menu_is_open(thread_id: u32) -> bool {
+    const GUI_INMENUMODE: u32 = 0x4;
+    const GUI_POPUPMENUMODE: u32 = 0x10;
+    gui_thread_flags(thread_id)
+        .is_some_and(|flags| flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE) != 0)
+}
+
+#[cfg(windows)]
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetCurrentThreadId() -> u32;
+}
+
+#[cfg(windows)]
+fn current_thread_id() -> u32 {
+    // SAFETY: no arguments, cannot fail.
+    unsafe { GetCurrentThreadId() }
+}
+
+/// `GUITHREADINFO.flags` of `thread_id`, or None if the call failed.
+#[cfg(windows)]
+fn gui_thread_flags(thread_id: u32) -> Option<u32> {
+    #[repr(C)]
+    struct GuiThreadInfo {
+        cb_size: u32,
+        flags: u32,
+        hwnds: [isize; 6],
+        caret: [i32; 4],
+    }
+    #[link(name = "user32")]
+    extern "system" {
+        fn GetGUIThreadInfo(thread_id: u32, info: *mut GuiThreadInfo) -> i32;
+    }
+
+    let mut info = GuiThreadInfo {
+        cb_size: std::mem::size_of::<GuiThreadInfo>() as u32,
+        flags: 0,
+        hwnds: [0; 6],
+        caret: [0; 4],
+    };
+    // SAFETY: `info` is a correctly sized GUITHREADINFO with cbSize set.
+    let ok = unsafe { GetGUIThreadInfo(thread_id, &mut info) };
+    (ok != 0).then_some(info.flags)
+}
+
+#[cfg(not(windows))]
+fn current_thread_id() -> u32 {
+    0
+}
+
+#[cfg(not(windows))]
+fn gui_thread_flags(_thread_id: u32) -> Option<u32> {
+    None
+}
+
 pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     let exe_path = std::env::current_exe().context("failed resolving executable path")?;
     if let Err(err) = autostart::set_enabled(&exe_path, cfg.autostart) {
@@ -411,6 +638,12 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     let autostart_enabled = autostart::is_enabled().unwrap_or(cfg.autostart);
 
     let event_loop = EventLoopBuilder::<UserEvent>::with_user_event().build();
+    // tao registers every mouse and keyboard for raw input by default, which
+    // includes hotplug notifications. Plugging or unplugging a mouse while the
+    // tray menu was open froze the menu for good: it stayed on screen but
+    // took no more mouse input, and clicks elsewhere did not close it (#50).
+    // We never read device events, so we do not register for them at all.
+    event_loop.set_device_event_filter(DeviceEventFilter::Always);
     let proxy = event_loop.create_proxy();
 
     MenuEvent::set_event_handler(Some({
@@ -475,6 +708,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
     let mut devices: Vec<BatteryState> = Vec::new();
     let mut selected_id = cfg.selected_device_id.clone();
     let mut subject = SubjectTracker::default();
+    let close_watch = MenuCloseWatch::new(proxy.clone());
 
     event_loop.run(move |event, _target, control_flow| {
         *control_flow = ControlFlow::Wait;
@@ -624,6 +858,12 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                             set_preset(&menu.cooldown_items, "cooldown", minutes);
                         }
                     } else if let Some(device_id) = id.strip_prefix("device:") {
+                        if !is_selectable(device_id, &devices) {
+                            // Its device left while the menu was open. Keep the
+                            // current choice; the rebuild that is waiting for
+                            // the menu to close replaces this item.
+                            return;
+                        }
                         selected_id = device_id.to_string();
                         cfg.selected_device_id = selected_id.clone();
                         menu.set_selected(&selected_id);
@@ -667,9 +907,7 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                         }
                     }
 
-                    if let Err(err) = menu.rebuild_device_menu(&devices, &selected_id) {
-                        tracing::warn!("failed rebuilding menu: {err}");
-                    }
+                    sync_device_menu(&mut menu, &devices, &selected_id, &close_watch);
                     if let Err(err) = refresh_tray_visuals(
                         &mut tray,
                         &devices,
@@ -681,6 +919,9 @@ pub fn run_tray_app(mut cfg: AppConfig) -> Result<()> {
                     ) {
                         tracing::warn!("failed refreshing tray: {err}");
                     }
+                }
+                UserEvent::MenuClosed => {
+                    sync_device_menu(&mut menu, &devices, &selected_id, &close_watch);
                 }
                 UserEvent::UpdateAvailable(version) => {
                     available_update = Some(version);
@@ -1058,9 +1299,12 @@ fn remove_item(submenu: &Submenu, item: &tray_icon::menu::MenuItemKind) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{
-        adopt_initial_device, battery_label, find_selected_device, forget_receiver, pick_subject,
-        tooltip_text, utf16_len, SubjectTracker, TOOLTIP_BUDGET,
+        adopt_initial_device, battery_label, device_menu_action, find_selected_device,
+        forget_receiver, is_selectable, pick_subject, shown_devices, tooltip_text, utf16_len,
+        DeviceMenuAction, SubjectTracker, TOOLTIP_BUDGET,
     };
+    #[cfg(windows)]
+    use super::{current_thread_id, gui_thread_flags, tray_menu_is_open};
     use crate::config::AUTO_SUBJECT_ID;
     use crate::i18n::Language;
     use crate::model::BatteryState;
@@ -1464,5 +1708,117 @@ mod tests {
                 "G502 X PLUS: 46%（充电中）",
             ]
         );
+    }
+
+    fn keys(keys: &[&str]) -> Vec<String> {
+        keys.iter().map(|key| key.to_string()).collect()
+    }
+
+    /// A battery reading is the common case and must never touch the menu's
+    /// structure, open or not.
+    #[test]
+    fn the_same_devices_are_updated_in_place_even_while_the_menu_is_open() {
+        let shown = keys(&["a", "b"]);
+        let devices = vec![at("a", 40), charging_at("b", 90)];
+        for open in [false, true] {
+            assert_eq!(
+                device_menu_action(Some(&shown), &devices, open),
+                DeviceMenuAction::UpdateInPlace
+            );
+        }
+        assert_eq!(
+            device_menu_action(Some(&[]), &[], true),
+            DeviceMenuAction::UpdateInPlace
+        );
+    }
+
+    #[test]
+    fn arrivals_and_departures_rebuild_when_closed_and_wait_while_open() {
+        let shown = keys(&["a", "b"]);
+        let arrived = vec![at("a", 40), at("b", 90), at("c", 70)];
+        let departed = vec![at("a", 40)];
+        let replaced = vec![at("a", 40), at("z", 90)];
+        for devices in [&arrived, &departed, &replaced, &Vec::new()] {
+            assert_eq!(
+                device_menu_action(Some(&shown), devices, false),
+                DeviceMenuAction::Rebuild
+            );
+            assert_eq!(
+                device_menu_action(Some(&shown), devices, true),
+                DeviceMenuAction::Defer
+            );
+        }
+        assert_eq!(
+            device_menu_action(Some(&[]), &departed, true),
+            DeviceMenuAction::Defer
+        );
+    }
+
+    /// While a rebuild waits for the menu to close, the items still showing
+    /// a connected device keep getting fresh readings, matched by key.
+    #[test]
+    fn shown_items_find_their_device_by_key_and_skip_departed_ones() {
+        let shown = keys(&["a", "gone", "b"]);
+        let devices = vec![at("b", 20), at("a", 40), at("new", 70)];
+        let found: Vec<_> = shown_devices(&shown, &devices)
+            .into_iter()
+            .map(|device| device.map(|d| (d.device_key.as_str(), d.battery_percent)))
+            .collect();
+        assert_eq!(found, [Some(("a", 40)), None, Some(("b", 20))]);
+    }
+
+    /// A departed device's item stays clickable until the menu closes; that
+    /// click must not pin a device that is not there.
+    #[test]
+    fn only_auto_and_connected_devices_can_be_picked() {
+        let devices = vec![at("a", 40)];
+        assert!(is_selectable("a", &devices));
+        assert!(is_selectable(AUTO_SUBJECT_ID, &devices));
+        assert!(is_selectable(AUTO_SUBJECT_ID, &[]));
+        assert!(!is_selectable("gone", &devices));
+    }
+
+    /// Before the first rebuild, or after one failed part way, the items may
+    /// not match anything, so an unchanged device list must not be patched.
+    #[test]
+    fn unknown_menu_contents_always_need_a_rebuild() {
+        for devices in [vec![], vec![at("a", 40)]] {
+            assert_eq!(
+                device_menu_action(None, &devices, false),
+                DeviceMenuAction::Rebuild
+            );
+            assert_eq!(
+                device_menu_action(None, &devices, true),
+                DeviceMenuAction::Defer
+            );
+        }
+    }
+
+    /// Items are matched to devices by position, so a new order (a device
+    /// renamed past another) needs new items even though the set is the same.
+    #[test]
+    fn a_new_order_counts_as_a_change() {
+        let shown = keys(&["a", "b"]);
+        let devices = vec![at("b", 40), at("a", 90)];
+        assert_eq!(
+            device_menu_action(Some(&shown), &devices, false),
+            DeviceMenuAction::Rebuild
+        );
+    }
+
+    /// A wrong struct size makes GetGUIThreadInfo fail, and that reads as
+    /// "menu closed", so check the call itself succeeds: on the thread itself,
+    /// as `sync_device_menu` asks, and from another thread, as the close watch
+    /// asks.
+    #[cfg(windows)]
+    #[test]
+    fn the_menu_check_reaches_windows_and_sees_no_menu_here() {
+        let here = current_thread_id();
+        assert!(gui_thread_flags(here).is_some());
+        assert!(!tray_menu_is_open(here));
+        let from_elsewhere = std::thread::spawn(move || gui_thread_flags(here))
+            .join()
+            .unwrap();
+        assert_eq!(from_elsewhere, Some(0));
     }
 }
